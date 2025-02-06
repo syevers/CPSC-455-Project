@@ -1,7 +1,7 @@
 {
   "compilerOptions": {
     "target": "ES2022",                // Modern JavaScript features while maintaining good compatibility
-    "module": "ESNext",                // Use ES modules
+    "module": "nodenext",             
     "moduleResolution": "Node",        // Resolve modules like Node.js does
     "outDir": "./dist",                // Output directory for transpiled JS files
     "rootDir": "./src",                // Root directory of your TypeScript source files
@@ -14,7 +14,8 @@
     "declaration": true,               // Generate declaration files if you need to publish the package
     "allowSyntheticDefaultImports": true, // Allow default imports even if module doesn't have a default export
     "isolatedModules": true,           // Ensure each file can be safely transpiled without relying on others
-    "noImplicitAny": true              // Raise error on expressions and declarations with an implied `any` type
+    "noImplicitAny": true, // Raise error on expressions and declarations with an implied `any` type
+    "allowJs": true
   },
   "include": ["src/**/*"],
   "exclude": ["node_modules", "dist"]
