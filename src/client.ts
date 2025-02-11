@@ -1,17 +1,30 @@
 import { WebSocket } from 'ws';
-import * as readline from 'node:readline';
+import readline from 'readline';
+import fs from 'fs';
 
-const ws = new WebSocket('ws://localhost:8080');
+
+// create the websocket
+const ws = new WebSocket('wss://localhost:8080', {
+  rejectUnauthorized: false,
+});
 
 console.log('Connecting to server...');
 
-let username: string, password: string;
-
-ws.on('connect', function connection(ws) {
-  console.log(['[CONNECTED]:']);
-
-});
 ws.on('error', console.error);
+
+ws.on('open', () => {
+  console.log('[CONNECTED] Please enter your credentials:\nUsername:');
+  // ws.send('this is a test message');
+});
+
+const loginFile = 'accounts.json';
+if (!fs.existsSync(loginFile)) {
+  fs.writeFileSync(loginFile, JSON.stringify([]));
+}
+
+const userData = JSON.parse(fs.readFileSync(loginFile));
+console.log();
+
 
 // get user input from cmdline
 const rl = readline.createInterface({
@@ -19,7 +32,13 @@ const rl = readline.createInterface({
   output: process.stdout,
 });
 
-rl.on('line', (input: any) => {
+let username, password;
+rl.on('line', (input: string) => {
+  if (!username) {
+    username = input.trim();
+    console.log('Password: ');
+
+  }
   console.log(input);
 });
 
