@@ -1,27 +1,39 @@
 import { WebSocket } from 'ws';
 import readline from 'readline';
-import fs from 'fs';
-import path from 'path'; //Import path module for file path handling
 
-
-// create the websocket
 const ws = new WebSocket('wss://localhost:8080', {
   rejectUnauthorized: false,
 });
 
 console.log('Connecting to server...');
 
-//handle recieved messages from the server
-ws.on('message', (data) => {
-  const message = data.toString();
+let welcomeMessageReceived = false;
 
-  // Ensure "Welcome" message appears right after "Connecting to server..."
-  if (message.includes('Welcome to the WebSocket server!')) {
-    console.log(`[SERVER]: ${message}`);
-    console.log('[CONNECTED] Please enter your credentials:');
-    console.log('Username:');
-  } else {
-    console.log(`[SERVER]: ${message}`);
+ws.on('message', (data) => {
+  try {
+    const message = JSON.parse(data.toString());
+
+    // Display system messages such as welcome messages or notifications
+    if (message.type === 'system') {
+      console.log(`[SERVER]: ${message.content}`);
+      welcomeMessageReceived = true;
+    } 
+    // Display public chat messages
+    else if (message.type === 'chat') {
+      console.log(message.content);
+    } 
+    // Display list of active users
+    else if (message.type === 'userList') {
+      console.log(`[ACTIVE USERS]: ${message.users.join(', ')}`);
+    }
+
+    // Show credentials prompt after welcome message
+    if (welcomeMessageReceived && !username) {
+      console.log('[CONNECTED] Please enter your credentials:');
+      console.log('Username:');
+    }
+  } catch {
+    console.log(`[SERVER]: ${data.toString()}`);
   }
 });
 
@@ -29,21 +41,12 @@ ws.on('error', (err) => {
   console.error('[ERROR]', err);
 });
 
+// Handle disconnection
+ws.on('close', () => {
+  console.log('[DISCONNECTED] You have left the chat room.');
+  process.exit(0); 
+});
 
-
-
-
-//File where user loging details are stored
-const loginFile = 'accounts.json';
-
-if (!fs.existsSync(loginFile)) {
-  fs.writeFileSync(loginFile, JSON.stringify([]));
-}
-
-const userData = JSON.parse(fs.readFileSync(loginFile, 'utf-8'));
-
-
-// get user input from cmdline
 const rl = readline.createInterface({
   input: process.stdin,
   output: process.stdout,
@@ -52,20 +55,20 @@ const rl = readline.createInterface({
 let username: string | undefined;
 let password: string | undefined;
 
+// Handle user input
 rl.on('line', (input: string) => {
   if (!username) {
     username = input.trim();
-    console.log('Password: ');
+    console.log('Password:');
   } else if (!password) {
     password = input.trim();
-    console.log(`[LOGIN] Attempting to login with ${username}`);
+    console.log(`[LOGIN] Logging in as ${username}`);
     ws.send(JSON.stringify({ username, password }));
-
-    //close input
-    rl.close();
+    console.log('You can now start chatting. Type a message, send a file using "/send <file_path>", or type "/logout" to disconnect.');
+  } else if (input === '/logout') {
+    console.log('[CLIENT] Logging out...');
+    ws.close(); // Close the WebSocket connection
+  } else {
+    ws.send(JSON.stringify({ message: input.trim() }));
   }
 });
-
-
-
-// TODO: make it so i can connect with wss (secure) instead of ws (insecure)
