@@ -24,6 +24,13 @@ const server = https.createServer(options).listen(PORT, () => {
 const wss = new WebSocketServer({ server });
 const users = new Map<WebSocket, string>();
 
+// Maps to track rate limiting
+const messageTimestamps = new Map<WebSocket, number[]>(); // Track user messages
+const blockedUsers = new Map<WebSocket, number>(); // Store temporarily blocked users
+
+const RATE_LIMIT = 5; // Max messages per second
+const BLOCK_DURATION = 10000; // Block duration in milliseconds (10 sec)
+
 console.log(`[SERVER] Listening for connections on port ${PORT}`);
 
 wss.on('connection', (ws) => {
@@ -34,6 +41,23 @@ wss.on('connection', (ws) => {
   ws.on('message', (data) => {
     try {
       const parsedData = JSON.parse(data.toString());
+
+      // Check if user is temporarily blocked
+      if (blockedUsers.has(ws)) {
+        const remainingTime = (blockedUsers.get(ws)! - Date.now()) / 1000;
+        if (remainingTime > 0) {
+          ws.send(JSON.stringify({ type: 'system', content: `[SERVER]: You are temporarily blocked. Try again in ${remainingTime.toFixed(1)} seconds.` }));
+          return;
+        } else {
+          blockedUsers.delete(ws);
+        }
+      }
+
+      // Apply rate limiting
+      if (!checkRateLimit(ws)) {
+        ws.send(JSON.stringify({ type: 'system', content: '[SERVER]: You are sending messages too quickly. Slow down!' }));
+        return;
+      }
 
       // Handle user login
       if (parsedData.username && parsedData.password) {
@@ -68,6 +92,26 @@ wss.on('connection', (ws) => {
 
   ws.send(JSON.stringify({ type: 'system', content: 'Welcome to the WebSocket server!' }));
 });
+
+// Function to enforce rate limits
+function checkRateLimit(ws: WebSocket): boolean {
+  const now = Date.now();
+  const timestamps = messageTimestamps.get(ws) || [];
+  
+  // Remove timestamps older than 1 second
+  const newTimestamps = timestamps.filter((timestamp) => now - timestamp < 1000);
+  newTimestamps.push(now);
+  messageTimestamps.set(ws, newTimestamps);
+
+  // If user exceeds RATE_LIMIT, block them temporarily
+  if (newTimestamps.length > RATE_LIMIT) {
+    console.log(`[SERVER] User exceeded rate limit. Blocking temporarily.`);
+    blockedUsers.set(ws, Date.now() + BLOCK_DURATION);
+    return false;
+  }
+
+  return true;
+}
 
 // Function to broadcast chat messages
 function broadcast(message: string, senderWs?: WebSocket) {
