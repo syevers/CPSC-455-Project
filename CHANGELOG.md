@@ -13,6 +13,6 @@ and this project adheres to [Semantic Versioning](http://semver.org/).
  - Connection via secure websockets (wss) from client to server.
  - begin implementation of authentication.
  
-## [0.1.1] - 2025-02-12
+## [0.1.2] - 2025-02-12
  - Fixed the log-in issue
  - added more information for the connecting server
