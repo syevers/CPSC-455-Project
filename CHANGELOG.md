@@ -16,3 +16,8 @@ and this project adheres to [Semantic Versioning](http://semver.org/).
 ## [0.1.2] - 2025-02-12
  - Fixed the log-in issue
  - added more information for the connecting server
+
+## [0.1.3] - 2025-02-14
+ - Fixed the connection between clients.
+ - Client can logout and send the file in the chatbox.
+ - Server'UI is more clear detail.
