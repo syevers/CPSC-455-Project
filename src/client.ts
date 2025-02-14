@@ -1,71 +1,94 @@
-import { WebSocket } from 'ws';
-import readline from 'readline';
-import fs from 'fs';
-import path from 'path'; //Import path module for file path handling
+import { readFileSync } from 'fs';
+import { WebSocketServer, WebSocket } from 'ws';
+import https from 'https';
+import { fileURLToPath } from 'url';
+import path from 'path';
 
+// Fix __dirname for ES Modules
+const __filename = fileURLToPath(import.meta.url);
+const __dirname = path.dirname(__filename);
 
-// create the websocket
-const ws = new WebSocket('wss://localhost:8080', {
-  rejectUnauthorized: false,
+const PORT = 8080;
+
+// SSL options for secure WebSocket connection
+const options = {
+  key: readFileSync('../certs/private.pem'),
+  cert: readFileSync('../certs/public.pem'),
+};
+
+// Create WebSocket Server
+const server = https.createServer(options).listen(PORT, () => {
+  console.log(`[SERVER] Running on wss://localhost:${PORT}`);
 });
 
-console.log('Connecting to server...');
+const wss = new WebSocketServer({ server });
+const users = new Map<WebSocket, string>();
 
-//handle recieved messages from the server
-ws.on('message', (data) => {
-  const message = data.toString();
+console.log(`[SERVER] Listening for connections on port ${PORT}`);
 
-  // Ensure "Welcome" message appears right after "Connecting to server..."
-  if (message.includes('Welcome to the WebSocket server!')) {
-    console.log(`[SERVER]: ${message}`);
-    console.log('[CONNECTED] Please enter your credentials:');
-    console.log('Username:');
-  } else {
-    console.log(`[SERVER]: ${message}`);
-  }
+wss.on('connection', (ws) => {
+  console.log('[SERVER] New client connected.');
+
+  ws.on('error', console.error);
+
+  ws.on('message', (data) => {
+    try {
+      const parsedData = JSON.parse(data.toString());
+
+      // Handle user login
+      if (parsedData.username && parsedData.password) {
+        users.set(ws, parsedData.username);
+        console.log(`[SERVER] ${parsedData.username} has logged in.`);
+        broadcast(`[SERVER]: ${parsedData.username} has joined the chat.`, ws);
+        sendUserList();
+        return;
+      }
+
+      // Handle chat messages
+      if (parsedData.message) {
+        const sender = users.get(ws) || 'Unknown';
+        console.log(`[SERVER] ${sender} says: ${parsedData.message}`);
+        broadcast(`[${sender}]: ${parsedData.message}`, ws);
+        return;
+      }
+    } catch (error) {
+      console.error('[SERVER] Error processing message:', error);
+    }
+  });
+
+  ws.on('close', () => {
+    const username = users.get(ws);
+    if (username) {
+      console.log(`[SERVER] ${username} has disconnected.`);
+      users.delete(ws);
+      broadcast(`[SERVER]: ${username} has left the chat.`);
+      sendUserList();
+    }
+  });
+
+  ws.send(JSON.stringify({ type: 'system', content: 'Welcome to the WebSocket server!' }));
 });
 
-ws.on('error', (err) => {
-  console.error('[ERROR]', err);
-});
-
-
-
-
-
-//File where user loging details are stored
-const loginFile = 'accounts.json';
-
-if (!fs.existsSync(loginFile)) {
-  fs.writeFileSync(loginFile, JSON.stringify([]));
+// Function to broadcast chat messages
+function broadcast(message: string, senderWs?: WebSocket) {
+  console.log(`[SERVER] Broadcasting message: ${message}`);
+  
+  wss.clients.forEach((client) => {
+    if (client !== senderWs && client.readyState === WebSocket.OPEN) {
+      console.log(`[SERVER] Sending message to client: ${message}`);
+      client.send(JSON.stringify({ type: 'chat', content: message }));
+    }
+  });
 }
 
-const userData = JSON.parse(fs.readFileSync(loginFile, 'utf-8'));
+// Function to send active user list
+function sendUserList() {
+  const userList = Array.from(users.values());
+  const userListMessage = JSON.stringify({ type: 'userList', users: userList });
 
-
-// get user input from cmdline
-const rl = readline.createInterface({
-  input: process.stdin,
-  output: process.stdout,
-});
-
-let username: string | undefined;
-let password: string | undefined;
-
-rl.on('line', (input: string) => {
-  if (!username) {
-    username = input.trim();
-    console.log('Password: ');
-  } else if (!password) {
-    password = input.trim();
-    console.log(`[LOGIN] Attempting to login with ${username}`);
-    ws.send(JSON.stringify({ username, password }));
-
-    //close input
-    rl.close();
-  }
-});
-
-
-
-// TODO: make it so i can connect with wss (secure) instead of ws (insecure)
+  wss.clients.forEach((client) => {
+    if (client.readyState === WebSocket.OPEN) {
+      client.send(userListMessage);
+    }
+  });
+}
