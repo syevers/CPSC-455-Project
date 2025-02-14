@@ -21,3 +21,4 @@ and this project adheres to [Semantic Versioning](http://semver.org/).
  - Fixed the connection between clients.
  - Client can logout and send the file in the chatbox.
  - Server'UI is more clear detail.
+ - Added implement rate limiting to prevent abuse
