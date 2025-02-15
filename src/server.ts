@@ -16,31 +16,67 @@ const options = {
   cert: readFileSync('../certs/public.pem'),
 };
 
-// Create WebSocket Server
-const server = https.createServer(options).listen(PORT, () => {
-  console.log(`[SERVER] Running on wss://localhost:${PORT}`);
-});
+// Create WebSocket Server that listens on all network interfaces (for multi-system access)
+const server = https.createServer(options).listen(PORT, '0.0.0.0', () => {
+  console.log(`[SERVER] Running on wss://0.0.0.0:${PORT}`);
+}); 
 
 const wss = new WebSocketServer({ server });
 const users = new Map<WebSocket, string>();
+const heartbeatMap = new Map<WebSocket, NodeJS.Timeout>();
 
 // Maps to track rate limiting
 const messageTimestamps = new Map<WebSocket, number[]>(); // Track user messages
 const blockedUsers = new Map<WebSocket, number>(); // Store temporarily blocked users
+const reconnectingClients = new Map<string, WebSocket>(); // Store users reconnecting 
+const aliveClients = new WeakMap<WebSocket, number>();;  
 
 const RATE_LIMIT = 5; // Max messages per second
 const BLOCK_DURATION = 10000; // Block duration in milliseconds (10 sec)
+const HEARTBEAT_INTERVAL = 30000; // Send heartbeat every 30 seconds 
+const RECONNECT_TIMEOUT = 30000; //  Users have 30 seconds to reconnect before being removed
 
 console.log(`[SERVER] Listening for connections on port ${PORT}`);
 
-wss.on('connection', (ws) => {
+wss.on('connection', (ws, req) => { 
   console.log('[SERVER] New client connected.');
+
+  let username: string | undefined;
+
+  // If a user is reconnecting, restore their session
+  if (req.headers['sec-websocket-protocol']) {
+    username = req.headers['sec-websocket-protocol']; // Use protocol header for reconnecting users
+    console.log(`[SERVER] ${username} reconnected.`);
+    
+    if (reconnectingClients.has(username)) {
+      reconnectingClients.delete(username); // Remove from reconnecting list
+    }
+  } //
 
   ws.on('error', console.error);
 
   ws.on('message', (data) => {
     try {
       const parsedData = JSON.parse(data.toString());
+
+      // Handle heartbeat (pong) from client 
+      if (parsedData.type === 'pong') {
+        aliveClients.set(ws, 0); // Mark as alive
+        return;
+      }
+
+      // Handle logout request
+      if (parsedData.type === 'logout') {
+        const username = users.get(ws); // Get username before deletion
+        if (username) {
+            console.log(`[SERVER] ${username} has logged out.`);
+            users.delete(ws); // Remove user from active list
+            broadcast(`[SERVER]: ${username} has left the chat.`);
+            sendUserList();
+        }
+        ws.terminate(); // Fully close connection
+        return;
+      }
 
       // Check if user is temporarily blocked
       if (blockedUsers.has(ws)) {
@@ -75,6 +111,7 @@ wss.on('connection', (ws) => {
         broadcast(`[${sender}]: ${parsedData.message}`, ws);
         return;
       }
+
     } catch (error) {
       console.error('[SERVER] Error processing message:', error);
     }
@@ -84,10 +121,16 @@ wss.on('connection', (ws) => {
     const username = users.get(ws);
     if (username) {
       console.log(`[SERVER] ${username} has disconnected.`);
-      users.delete(ws);
-      broadcast(`[SERVER]: ${username} has left the chat.`);
-      sendUserList();
+      setTimeout(() => {
+        if (!users.has(ws)) {
+          users.delete(ws);
+          broadcast(`[SERVER]: ${username} has left the chat.`);
+          sendUserList();
+        }
+      }, REMOVE_DISCONNECTED_USERS_DELAY);
     }
+
+    stopHeartbeat(ws);
   });
 
   ws.send(JSON.stringify({ type: 'system', content: 'Welcome to the WebSocket server!' }));
@@ -136,3 +179,23 @@ function sendUserList() {
     }
   });
 }
+
+// Function to send heartbeat pings to all clients
+function sendHeartbeats() {
+  wss.clients.forEach((ws) => {
+    if (ws.readyState === WebSocket.OPEN) {
+      ws.send(JSON.stringify({ type: 'ping' })); // Send heartbeat ping
+    }
+  });
+}
+
+// Stop heartbeat for a client
+function stopHeartbeat(ws: WebSocket) {
+  if (heartbeatMap.has(ws)) {
+    clearInterval(heartbeatMap.get(ws)!);
+    heartbeatMap.delete(ws);
+  }
+}
+
+// Send heartbeat pings every 30 seconds
+setInterval(sendHeartbeats, HEARTBEAT_INTERVAL); 
