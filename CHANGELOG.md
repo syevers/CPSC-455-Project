@@ -29,3 +29,4 @@ and this project adheres to [Semantic Versioning](http://semver.org/).
  - Closed connection and program after logging out
  - Fixed account storing to file
  - Duplicate username detection
+ - README updated.
