@@ -1,57 +1,164 @@
-import { readFileSync } from 'fs';
+import { readFileSync, writeFileSync, existsSync } from 'fs';
 import { WebSocketServer, WebSocket } from 'ws';
 import https from 'https';
 import { fileURLToPath } from 'url';
 import path from 'path';
 
-// Fix __dirname for ES Modules
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 
 const PORT = 8080;
-
-// SSL options for secure WebSocket connection
 const options = {
   key: readFileSync('../certs/private.pem'),
   cert: readFileSync('../certs/public.pem'),
 };
 
-// Create WebSocket Server that listens on all network interfaces (for multi-system access)
+// Initialize accounts file if it doesn't exist
+function initializeAccountsFile() {
+  const accountsPath = path.join(__dirname, 'accounts.json');
+  if (!existsSync(accountsPath)) {
+    console.log('[SERVER] Creating new accounts.json file');
+    const emptyAccounts = {
+      users: [],
+    };
+    writeFileSync(accountsPath, JSON.stringify(emptyAccounts, null, 2), 'utf8');
+    return emptyAccounts;
+  }
+  return null;
+}
+
+// Load accounts from JSON file
+function loadAccounts() {
+  const accountsPath = path.join(__dirname, 'accounts.json');
+
+  try {
+    // Try to initialize file if it doesn't exist
+    const initialized = initializeAccountsFile();
+    if (initialized) {
+      return initialized;
+    }
+
+    // Read existing file
+    const accountsData = readFileSync(accountsPath, 'utf8');
+    const parsed = JSON.parse(accountsData);
+
+    // Ensure the parsed data has a users array
+    if (!parsed || !Array.isArray(parsed.users)) {
+      console.error('[SERVER] Invalid accounts.json format. Resetting to empty.');
+      const emptyAccounts = {
+        users: [],
+      };
+      writeFileSync(accountsPath, JSON.stringify(emptyAccounts, null, 2), 'utf8');
+      return emptyAccounts;
+    }
+
+    return parsed;
+  }
+  catch (error) {
+    console.error('[SERVER] Error loading accounts:', error);
+    // If there's an error, try to reset the file to a valid state
+    try {
+      const emptyAccounts = {
+        users: [],
+      };
+      writeFileSync(accountsPath, JSON.stringify(emptyAccounts, null, 2), 'utf8');
+      return emptyAccounts;
+    }
+    catch (writeError) {
+      console.error('[SERVER] Failed to reset accounts.json:', writeError);
+      return { users: [] };
+    }
+  }
+}
+
 const server = https.createServer(options).listen(PORT, '0.0.0.0', () => {
   console.log(`[SERVER] Running on wss://0.0.0.0:${PORT}`);
-}); 
+});
 
 const wss = new WebSocketServer({ server });
 const users = new Map<WebSocket, string>();
 const heartbeatMap = new Map<WebSocket, NodeJS.Timeout>();
+const messageTimestamps = new Map<WebSocket, number[]>();
+const blockedUsers = new Map<WebSocket, number>();
+const reconnectingClients = new Map<string, WebSocket>();
+const aliveClients = new WeakMap<WebSocket, number>();
 
-// Maps to track rate limiting
-const messageTimestamps = new Map<WebSocket, number[]>(); // Track user messages
-const blockedUsers = new Map<WebSocket, number>(); // Store temporarily blocked users
-const reconnectingClients = new Map<string, WebSocket>(); // Store users reconnecting 
-const aliveClients = new WeakMap<WebSocket, number>();;  
-
-const RATE_LIMIT = 5; // Max messages per second
-const BLOCK_DURATION = 10000; // Block duration in milliseconds (10 sec)
-const HEARTBEAT_INTERVAL = 30000; // Send heartbeat every 30 seconds 
-const RECONNECT_TIMEOUT = 30000; //  Users have 30 seconds to reconnect before being removed
+const RATE_LIMIT = 5;
+const BLOCK_DURATION = 10000;
+const HEARTBEAT_INTERVAL = 30000;
+const RECONNECT_TIMEOUT = 30000;
 
 console.log(`[SERVER] Listening for connections on port ${PORT}`);
 
-wss.on('connection', (ws, req) => { 
+// Function to validate user credentials
+// Add new user to accounts.json
+function addNewUser(username: string, password: string): boolean {
+  try {
+    const accounts = loadAccounts();
+
+    // Check for duplicate username
+    if (accounts.users.some((user: { username: string }) => user.username === username)) {
+      console.log('[SERVER] Username already exists:', username);
+      return false;
+    }
+
+    // Add new user
+    accounts.users.push({ username, password });
+
+    // Save updated accounts
+    const accountsPath = path.join(__dirname, 'accounts.json');
+    writeFileSync(accountsPath, JSON.stringify(accounts, null, 2), 'utf8');
+    console.log('[SERVER] New user added:', username);
+    return true;
+  }
+  catch (error) {
+    console.error('[SERVER] Error adding new user:', error);
+    return false;
+  }
+}
+
+// Validate or create user account
+function validateCredentials(username: string, password: string): boolean {
+  const accounts = loadAccounts();
+
+  // Additional safety check
+  if (!accounts || !Array.isArray(accounts.users)) {
+    console.error('[SERVER] Invalid accounts data structure');
+    return false;
+  }
+
+  try {
+    const user = accounts.users.find((u: { username: string; password: string }) =>
+      u.username === username,
+    );
+
+    if (!user) {
+      // User doesn't exist, create new account
+      console.log('[SERVER] Creating new user account:', username);
+      return addNewUser(username, password);
+    }
+
+    return user.password === password;
+  }
+  catch (error) {
+    console.error('[SERVER] Error validating credentials:', error);
+    return false;
+  }
+}
+
+wss.on('connection', (ws, req) => {
   console.log('[SERVER] New client connected.');
 
   let username: string | undefined;
 
-  // If a user is reconnecting, restore their session
   if (req.headers['sec-websocket-protocol']) {
-    username = req.headers['sec-websocket-protocol']; // Use protocol header for reconnecting users
+    username = req.headers['sec-websocket-protocol'];
     console.log(`[SERVER] ${username} reconnected.`);
-    
+
     if (reconnectingClients.has(username)) {
-      reconnectingClients.delete(username); // Remove from reconnecting list
+      reconnectingClients.delete(username);
     }
-  } //
+  }
 
   ws.on('error', console.error);
 
@@ -59,60 +166,84 @@ wss.on('connection', (ws, req) => {
     try {
       const parsedData = JSON.parse(data.toString());
 
-      // Handle heartbeat (pong) from client 
       if (parsedData.type === 'pong') {
-        aliveClients.set(ws, 0); // Mark as alive
+        aliveClients.set(ws, 0);
         return;
       }
 
-      // Handle logout request
       if (parsedData.type === 'logout') {
-        const username = users.get(ws); // Get username before deletion
+        const username = users.get(ws);
         if (username) {
-            console.log(`[SERVER] ${username} has logged out.`);
-            users.delete(ws); // Remove user from active list
-            broadcast(`[SERVER]: ${username} has left the chat.`);
-            sendUserList();
+          console.log(`[SERVER] ${username} has logged out.`);
+          users.delete(ws);
+          broadcast(`[SERVER]: ${username} has left the chat.`);
+          sendUserList();
         }
-        ws.terminate(); // Fully close connection
+        ws.close();
         return;
       }
 
-      // Check if user is temporarily blocked
       if (blockedUsers.has(ws)) {
         const remainingTime = (blockedUsers.get(ws)! - Date.now()) / 1000;
         if (remainingTime > 0) {
-          ws.send(JSON.stringify({ type: 'system', content: `[SERVER]: You are temporarily blocked. Try again in ${remainingTime.toFixed(1)} seconds.` }));
+          ws.send(JSON.stringify({
+            type: 'system',
+            content: `[SERVER]: You are temporarily blocked. Try again in ${remainingTime.toFixed(1)} seconds.`,
+          }));
           return;
-        } else {
+        }
+        else {
           blockedUsers.delete(ws);
         }
       }
 
-      // Apply rate limiting
       if (!checkRateLimit(ws)) {
-        ws.send(JSON.stringify({ type: 'system', content: '[SERVER]: You are sending messages too quickly. Slow down!' }));
+        ws.send(JSON.stringify({
+          type: 'system',
+          content: '[SERVER]: You are sending messages too quickly. Slow down!',
+        }));
         return;
       }
 
-      // Handle user login
-      if (parsedData.username && parsedData.password) {
-        users.set(ws, parsedData.username);
-        console.log(`[SERVER] ${parsedData.username} has logged in.`);
-        broadcast(`[SERVER]: ${parsedData.username} has joined the chat.`, ws);
-        sendUserList();
+      // Handle login
+      if (parsedData.type === 'login') {
+        const { username, password } = parsedData;
+
+        // Check if username is already connected
+        for (const [_, existingUser] of users) {
+          if (existingUser === username) {
+            ws.send(JSON.stringify({
+              type: 'system',
+              content: 'Login failed: User already connected',
+            }));
+            return;
+          }
+        }
+
+        // Validate credentials
+        if (validateCredentials(username, password)) {
+          users.set(ws, username);
+          console.log(`[SERVER] ${username} has logged in.`);
+          ws.send(JSON.stringify({ type: 'system', content: 'Login successful' }));
+          broadcast(`[SERVER]: ${username} has joined the chat.`, ws);
+          sendUserList();
+        }
+        else {
+          ws.send(JSON.stringify({ type: 'system', content: 'Login failed' }));
+        }
         return;
       }
 
       // Handle chat messages
-      if (parsedData.message) {
+      if (parsedData.type === 'message') {
         const sender = users.get(ws) || 'Unknown';
         console.log(`[SERVER] ${sender} says: ${parsedData.message}`);
         broadcast(`[${sender}]: ${parsedData.message}`, ws);
         return;
       }
 
-    } catch (error) {
+    }
+    catch (error) {
       console.error('[SERVER] Error processing message:', error);
     }
   });
@@ -136,19 +267,15 @@ wss.on('connection', (ws, req) => {
   ws.send(JSON.stringify({ type: 'system', content: 'Welcome to the WebSocket server!' }));
 });
 
-// Function to enforce rate limits
 function checkRateLimit(ws: WebSocket): boolean {
   const now = Date.now();
   const timestamps = messageTimestamps.get(ws) || [];
-  
-  // Remove timestamps older than 1 second
   const newTimestamps = timestamps.filter((timestamp) => now - timestamp < 1000);
   newTimestamps.push(now);
   messageTimestamps.set(ws, newTimestamps);
 
-  // If user exceeds RATE_LIMIT, block them temporarily
   if (newTimestamps.length > RATE_LIMIT) {
-    console.log(`[SERVER] User exceeded rate limit. Blocking temporarily.`);
+    console.log('[SERVER] User exceeded rate limit. Blocking temporarily.');
     blockedUsers.set(ws, Date.now() + BLOCK_DURATION);
     return false;
   }
@@ -156,19 +283,16 @@ function checkRateLimit(ws: WebSocket): boolean {
   return true;
 }
 
-// Function to broadcast chat messages
 function broadcast(message: string, senderWs?: WebSocket) {
   console.log(`[SERVER] Broadcasting message: ${message}`);
-  
+
   wss.clients.forEach((client) => {
     if (client !== senderWs && client.readyState === WebSocket.OPEN) {
-      console.log(`[SERVER] Sending message to client: ${message}`);
       client.send(JSON.stringify({ type: 'chat', content: message }));
     }
   });
 }
 
-// Function to send active user list
 function sendUserList() {
   const userList = Array.from(users.values());
   const userListMessage = JSON.stringify({ type: 'userList', users: userList });
@@ -180,16 +304,14 @@ function sendUserList() {
   });
 }
 
-// Function to send heartbeat pings to all clients
 function sendHeartbeats() {
   wss.clients.forEach((ws) => {
     if (ws.readyState === WebSocket.OPEN) {
-      ws.send(JSON.stringify({ type: 'ping' })); // Send heartbeat ping
+      ws.send(JSON.stringify({ type: 'ping' }));
     }
   });
 }
 
-// Stop heartbeat for a client
 function stopHeartbeat(ws: WebSocket) {
   if (heartbeatMap.has(ws)) {
     clearInterval(heartbeatMap.get(ws)!);
@@ -197,5 +319,4 @@ function stopHeartbeat(ws: WebSocket) {
   }
 }
 
-// Send heartbeat pings every 30 seconds
-setInterval(sendHeartbeats, HEARTBEAT_INTERVAL); 
+setInterval(sendHeartbeats, HEARTBEAT_INTERVAL);

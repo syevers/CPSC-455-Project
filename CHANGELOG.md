@@ -24,3 +24,8 @@ and this project adheres to [Semantic Versioning](http://semver.org/).
  - Added implement rate limiting to prevent abuse
  - Added reconnect clients automatically in case of interruptions
  - Fixed Active user list
+
+## 0.0.4 - 2025-02-14
+ - Closed connection and program after logging out
+ - Fixed account storing to file
+ - Duplicate username detection
