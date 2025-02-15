@@ -21,7 +21,7 @@ This project implements a WebSocket-based secure chat application using TypeScri
 
 Before running the project, ensure you have the following installed:
 
-- Node.js (version 18+ recommended)  
+- Node.js (version 23+ recommended)  
 - TypeScript (`npm install -g typescript`)  
 - ts-node for running TypeScript files (`npm install -g ts-node`)  
 - WebSocket package (`npm install ws`)  
@@ -78,7 +78,7 @@ To log out, type:
 
 ## Troubleshooting
 ### 1. Connection Refused (ECONNREFUSED)
- - Ensure the server is running (ts-node src/server.ts).
+ - Ensure the server is running (node src/server.ts).
  - Verify that port 8080 is open (netstat -an | find "8080").
  - If running on Windows, allow port 8080 through the firewall:
  - Open Windows Defender Firewall.
