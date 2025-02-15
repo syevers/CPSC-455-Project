@@ -127,7 +127,7 @@ wss.on('connection', (ws, req) => {
           broadcast(`[SERVER]: ${username} has left the chat.`);
           sendUserList();
         }
-      }, REMOVE_DISCONNECTED_USERS_DELAY);
+      }, RECONNECT_TIMEOUT);
     }
 
     stopHeartbeat(ws);
