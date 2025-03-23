@@ -1,6 +1,7 @@
 import { WebSocket } from 'ws';
 import readline from 'readline';
 import { exit } from 'process';
+import os from 'node:os';
 
 let username: string | undefined;
 let password: string | undefined;
