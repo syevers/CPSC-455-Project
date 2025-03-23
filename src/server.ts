@@ -1,3 +1,4 @@
+import os from 'node:os';
 import { readFileSync, writeFileSync, existsSync } from 'fs';
 import { WebSocketServer, WebSocket } from 'ws';
 import https from 'https';
@@ -71,8 +72,22 @@ function loadAccounts() {
   }
 }
 
-const server = https.createServer(options).listen(PORT, '0.0.0.0', () => {
-  console.log(`[SERVER] Running on wss://0.0.0.0:${PORT}`);
+function getLocalIPAddress() {
+  const interfaces = os.networkInterfaces();
+  for (const interfaceName in interfaces) {
+    for (const iface of interfaces[interfaceName]) {
+      if (iface.family === 'IPv4' && !iface.internal) {
+        return iface.address;
+      }
+    }
+  }
+  // fallback to localhost (for now)
+  return '127.0.0.1';
+}
+
+const serverAddress = getLocalIPAddress();
+const server = https.createServer(options).listen(PORT, serverAddress, () => {
+  console.log(`[SERVER] Running on wss:${serverAddress}:${PORT}`);
 });
 
 const wss = new WebSocketServer({ server });
