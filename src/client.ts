@@ -8,7 +8,20 @@ let ws: WebSocket | null = null;
 let shouldReconnect = true;
 let isLoggedIn = false;
 
-const SERVER_IP = '127.0.0.1';
+function getLocalIPAddress() {
+  const interfaces = os.networkInterfaces();
+  for (const interfaceName in interfaces) {
+    for (const iface of interfaces[interfaceName]) {
+      if (iface.family === 'IPv4' && !iface.internal) {
+        return iface.address;
+      }
+    }
+  }
+  // fallback to localhost (for now)
+  return '127.0.0.1';
+}
+
+const SERVER_IP = getLocalIPAddress();
 const SERVER_URL = `wss://${SERVER_IP}:8080`;
 
 function connectWebSocket() {
