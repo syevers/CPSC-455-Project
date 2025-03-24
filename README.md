@@ -6,6 +6,7 @@ This project implements a WebSocket-based secure chat application using TypeScri
 
 - A WebSocket server (`server.ts`) running over `wss://` (WebSocket Secure) with HTTPS.  
 - A client application (`client.ts`) that connects to the WebSocket server for real-time messaging.
+- 
 
 ## Features
 
@@ -15,7 +16,13 @@ This project implements a WebSocket-based secure chat application using TypeScri
 - Active user tracking  
 - Auto-reconnect on connection loss  
 - `/logout` command for disconnecting  
-- Heartbeat mechanism for connection health monitoring  
+- Heartbeat mechanism for connection health monitoring
+-  **Secure file transfers** with encryption  
+- **Emoji & rich media support** (basic text formatting for bold, italics, and links)  
+- **Security hardening** with brute-force protection and robust logging  
+- **End-to-End encryption** exploration (AES-256 for message content, RSA-4096 for key exchange)  
+- **User authentication** with username and password creation, stored via hashed credentials  
+
 
 ## Prerequisites
 
