@@ -43,7 +43,7 @@ function sendEncryptedFile(filePath: string, recipient: string) {
   console.log(`[CLIENT] Sent encrypted file "${filename}" to ${recipient}`);
 }
 
-// ✅ Handle incoming encrypted file
+// Handle incoming encrypted file
 function handleIncomingFile(msg: any) {
   const { filename, from, data, iv, key } = msg;
   const encryptedData = Buffer.from(data, 'base64');
@@ -149,9 +149,9 @@ function connectWebSocket() {
 
           const savePath = `received_from_${from}_${filename}`;
           fs.writeFileSync(savePath, decrypted);
-          console.log(`[CLIENT] ✅ Received file "${filename}" from ${from}, saved as "${savePath}"`);
+          console.log(`[CLIENT]  Received file "${filename}" from ${from}, saved as "${savePath}"`);
         } catch (err) {
-          console.error('[CLIENT] ❌ Failed to decrypt file:', err);
+          console.error('[CLIENT]  Failed to decrypt file:', err);
         }
       }
     }
@@ -218,7 +218,7 @@ function connectWebSocket() {
         return;
       }
 
-      sendEncryptedFile(filePath, recipient); // ⬅️ call your encryption + sending
+      sendEncryptedFile(filePath, recipient); // call your encryption + sending
     }
     else {
       if (!ws || ws.readyState !== WebSocket.OPEN) {
