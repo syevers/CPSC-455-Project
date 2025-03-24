@@ -1,13 +1,70 @@
 import { WebSocket } from 'ws';
+import os from 'node:os';
 import readline from 'readline';
 import { exit } from 'process';
-import os from 'node:os';
+import fs from 'fs';
+import crypto from 'crypto';
+import path from 'path';
+
+
 
 let username: string | undefined;
 let password: string | undefined;
 let ws: WebSocket | null = null;
 let shouldReconnect = true;
 let isLoggedIn = false;
+
+function sendEncryptedFile(filePath: string, recipient: string) {
+  if (!ws || ws.readyState !== WebSocket.OPEN) {
+    console.log('[CLIENT] WebSocket is not connected.');
+    return;
+  }
+
+  const filename = path.basename(filePath);
+  const fileBuffer = fs.readFileSync(filePath);
+
+  const key = crypto.randomBytes(32); // AES-256
+  const iv = crypto.randomBytes(12);  // GCM IV
+
+  const cipher = crypto.createCipheriv('aes-256-gcm', key, iv);
+  const encrypted = Buffer.concat([cipher.update(fileBuffer), cipher.final()]);
+  const authTag = cipher.getAuthTag();
+
+  const payload = {
+    type: 'file',
+    to: recipient,
+    filename,
+    data: Buffer.concat([encrypted, authTag]).toString('base64'),
+    iv: iv.toString('base64'),
+    key: key.toString('base64')
+  };
+
+  ws.send(JSON.stringify(payload));
+  console.log(`[CLIENT] Sent encrypted file "${filename}" to ${recipient}`);
+}
+
+// ✅ Handle incoming encrypted file
+function handleIncomingFile(msg: any) {
+  const { filename, from, data, iv, key } = msg;
+  const encryptedData = Buffer.from(data, 'base64');
+  const fileKey = Buffer.from(key, 'base64');
+  const fileIV = Buffer.from(iv, 'base64');
+
+  const authTag = encryptedData.slice(-16);
+  const encrypted = encryptedData.slice(0, -16);
+
+  try {
+    const decipher = crypto.createDecipheriv('aes-256-gcm', fileKey, fileIV);
+    decipher.setAuthTag(authTag);
+    const decrypted = Buffer.concat([decipher.update(encrypted), decipher.final()]);
+
+    const savePath = `received_from_${from}_${filename}`;
+    fs.writeFileSync(savePath, decrypted);
+    console.log(`[CLIENT] Received and decrypted file saved as "${savePath}"`);
+  } catch (err) {
+    console.error('[CLIENT] Failed to decrypt file:', err);
+  }
+}
 
 function getLocalIPAddress() {
   const interfaces = os.networkInterfaces();
@@ -76,6 +133,27 @@ function connectWebSocket() {
       else if (message.type === 'ping') {
         ws!.send(JSON.stringify({ type: 'pong' }));
       }
+      else if (message.type === 'file') {
+        const { filename, from, data, iv, key } = message;
+        const encryptedData = Buffer.from(data, 'base64');
+        const fileKey = Buffer.from(key, 'base64');
+        const fileIV = Buffer.from(iv, 'base64');
+
+        const authTag = encryptedData.slice(-16);
+        const encrypted = encryptedData.slice(0, -16);
+
+        try {
+          const decipher = crypto.createDecipheriv('aes-256-gcm', fileKey, fileIV);
+          decipher.setAuthTag(authTag);
+          const decrypted = Buffer.concat([decipher.update(encrypted), decipher.final()]);
+
+          const savePath = `received_from_${from}_${filename}`;
+          fs.writeFileSync(savePath, decrypted);
+          console.log(`[CLIENT] ✅ Received file "${filename}" from ${from}, saved as "${savePath}"`);
+        } catch (err) {
+          console.error('[CLIENT] ❌ Failed to decrypt file:', err);
+        }
+      }
     }
     catch {
       console.log(`[SERVER]: ${data.toString()}`);
@@ -133,6 +211,15 @@ function connectWebSocket() {
       ws!.close();
       exit();
     }
+    else if (input.startsWith('/send ')) {
+      const [ , filePath, recipient ] = input.trim().split(' ');
+      if (!filePath || !recipient) {
+        console.log('[USAGE] /send <file_path> <recipient>');
+        return;
+      }
+
+      sendEncryptedFile(filePath, recipient); // ⬅️ call your encryption + sending
+    }
     else {
       if (!ws || ws.readyState !== WebSocket.OPEN) {
         console.log('[ERROR] Connection lost. Reconnecting...');
@@ -143,5 +230,7 @@ function connectWebSocket() {
     }
   });
 }
+
+
 
 connectWebSocket();

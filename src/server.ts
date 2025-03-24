@@ -4,6 +4,25 @@ import { WebSocketServer, WebSocket } from 'ws';
 import https from 'https';
 import { fileURLToPath } from 'url';
 import path from 'path';
+import crypto from 'crypto';
+
+
+// Updated Brutte-Force protection
+const loginAttempts = new Map<string, { count: number, lastAttempt: number }>();
+const MAX_ATTEMPTS = 5;
+const LOCKOUT_DURATION_MS = 30 * 1000; // 30 seconds
+
+
+// Updated for Hash password
+function hashPassword(password: string, salt = crypto.randomBytes(16).toString('hex')) {
+  const hash = crypto.pbkdf2Sync(password, salt, 1000, 64, 'sha512').toString('hex');
+  return { hash, salt };
+}
+
+function verifyPassword(password: string, storedHash: string, salt: string): boolean {
+  const hash = crypto.pbkdf2Sync(password, salt, 1000, 64, 'sha512').toString('hex');
+  return hash === storedHash;
+}
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -117,8 +136,9 @@ function addNewUser(username: string, password: string): boolean {
       return false;
     }
 
-    // Add new user
-    accounts.users.push({ username, password });
+    // Updated hash and salt for password
+    const { hash, salt } = hashPassword(password);
+    accounts.users.push({ username, hash, salt });
 
     // Save updated accounts
     const accountsPath = path.join(__dirname, 'accounts.json');
@@ -143,7 +163,7 @@ function validateCredentials(username: string, password: string): boolean {
   }
 
   try {
-    const user = accounts.users.find((u: { username: string; password: string }) =>
+    const user = accounts.users.find((u: { username: string; hash: string; salt: string }) =>
       u.username === username,
     );
 
@@ -153,7 +173,7 @@ function validateCredentials(username: string, password: string): boolean {
       return addNewUser(username, password);
     }
 
-    return user.password === password;
+    return verifyPassword(password, user.hash, user.salt);
   }
   catch (error) {
     console.error('[SERVER] Error validating credentials:', error);
@@ -184,6 +204,56 @@ wss.on('connection', (ws, req) => {
       if (parsedData.type === 'pong') {
         aliveClients.set(ws, 0);
         return;
+      }
+
+      // Updated encrypt file transfer
+      if (parsedData.type === 'file') {
+        const targetUser = parsedData.to;
+        const recipientSocket = [...users.entries()].find(([sock, name]) => name === targetUser)?.[0];
+
+        if (recipientSocket && recipientSocket.readyState === WebSocket.OPEN) {
+          recipientSocket.send(JSON.stringify({
+            type: 'file',
+            filename: parsedData.filename,
+            from: users.get(ws),
+            data: parsedData.data,
+            iv: parsedData.iv,
+            key: parsedData.key
+          }));
+          console.log(`[SERVER] Encrypted file "${parsedData.filename}" sent from ${users.get(ws)} to ${targetUser}`);
+        } else {
+          ws.send(JSON.stringify({ type: 'system', content: `[SERVER] User "${targetUser}" not found.` }));
+        }
+        return;
+      }
+
+      // Chat logging
+      if (parsedData.type === 'chat') {
+        const fromUser = users.get(ws); // assumes 'users' Map<WebSocket, username> exists
+        const toUser = parsedData.to;
+        const message = parsedData.message;
+
+        if (!fromUser || !toUser || !message) return;
+
+        const timestamp = new Date().toISOString();
+        const logDir = path.join(__dirname, 'logs');
+        if (!existsSync(logDir)) fs.mkdirSync(logDir);
+
+        const logFileName = `chatlog_${fromUser}_to_${toUser}_${new Date().toISOString().split('T')[0]}.txt`;
+        const logFilePath = path.join(logDir, logFileName);
+        const logEntry = `[${timestamp}] ${fromUser} to ${toUser}: ${message}\n`;
+
+        writeFileSync(logFilePath, logEntry, { flag: 'a' });
+
+        // Forward message to recipient if connected
+        const recipientSocket = [...users.entries()].find(([sock, name]) => name === toUser)?.[0];
+        if (recipientSocket && recipientSocket.readyState === WebSocket.OPEN) {
+          recipientSocket.send(JSON.stringify({
+            type: 'chat',
+            from: fromUser,
+            message: message
+          }));
+        }
       }
 
       if (parsedData.type === 'logout') {
@@ -222,7 +292,21 @@ wss.on('connection', (ws, req) => {
 
       // Handle login
       if (parsedData.type === 'login') {
-        const { username, password } = parsedData;
+        const username = parsedData.username?.trim();
+        const password = parsedData.password?.trim();
+        const now = Date.now();
+        // Updated for brute-force
+        const attempt = loginAttempts.get(username);
+
+        // ⛔ User is locked out
+        if (attempt && attempt.count >= MAX_ATTEMPTS && now - attempt.lastAttempt < LOCKOUT_DURATION_MS) {
+          const waitTime = Math.ceil((LOCKOUT_DURATION_MS - (now - attempt.lastAttempt)) / 1000);
+          ws.send(JSON.stringify({
+            type: 'system',
+            content: `Too many failed attempts. Try again in ${waitTime} seconds.`,
+          }));
+          return;
+        }
 
         // Check if username is already connected
         for (const [_, existingUser] of users) {
@@ -237,6 +321,8 @@ wss.on('connection', (ws, req) => {
 
         // Validate credentials
         if (validateCredentials(username, password)) {
+          loginAttempts.delete(username); // reset count
+
           users.set(ws, username);
           console.log(`[SERVER] ${username} has logged in.`);
           ws.send(JSON.stringify({ type: 'system', content: 'Login successful' }));
@@ -244,6 +330,13 @@ wss.on('connection', (ws, req) => {
           sendUserList();
         }
         else {
+          // Invalid password
+          const updated = {
+            count: (attempt?.count || 0) + 1,
+            lastAttempt: now
+          };
+          loginAttempts.set(username, updated);
+
           ws.send(JSON.stringify({ type: 'system', content: 'Login failed' }));
         }
         return;

@@ -1,8 +1,19 @@
 {
   "users": [
     {
-      "username": "testuser",
-      "password": "testpass"
+      "username": "user1",
+      "hash": "c6f71c547a290096ff206875686d3a4dedc303c0b9db2a35ea8bfbc53826ca6e561818e311da5d36552c38d6377c79470287e36415a2449e1bdde8886ea5de2d",
+      "salt": "e5dc0530ff344bce12c3af759ba31789"
     },
+    {
+      "username": "user2",
+      "hash": "8e8a0d6e6ca558f128f5f6b96c6646c6b3cd232ae3dfb0d5b98106cebbfcc2443eb5e44beec2726810047e295216e0befb0444c8c47cb848478b2f07edd0da0e",
+      "salt": "61bfcfe954b326b04b0ec395f5bad83c"
+    },
+    {
+      "username": "/logout",
+      "hash": "68586a9ae8ee94eb276882e2eb046f8d5bf857901dbfd287649d4f764304fa7483d32cb5b25ebb09aef7e15007a798f96693268e104857cc0a4df2fb74e93947",
+      "salt": "5fcf360ca8ca471f536cbc9faa68ad48"
+    }
   ]
 }

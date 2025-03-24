@@ -1,0 +1,46 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0"/>
+  <title>SecureChat Login</title>
+  <link rel="stylesheet" href="styles.css" />
+</head>
+<body>
+  <div class="container">
+    <h1 class="logo">SecureChat</h1>
+    <p class="subtitle">Secure messaging for everyone</p>
+
+    <div class="login-box">
+      <h2>Login to SecureChat</h2>
+      <p>Enter your credentials to access your account</p>
+
+      <form id="loginForm">
+        <label for="username">Username</label>
+        <input type="text" id="username" placeholder="Enter your username" required />
+
+        <label for="password">Password</label>
+        <input type="password" id="password" placeholder="Enter your password" required />
+
+        <button type="submit">Login</button>
+      </form>
+
+      <p class="register-link">Don't have an account? <a href="register.html">Register</a></p>
+    </div>
+
+    <div class="chat-container" style="display:none;">
+      <div class="chat-header">
+        <h3>Welcome to SecureChat</h3>
+        <button id="logoutBtn">Logout</button>
+      </div>
+      <div id="chatWindow" class="chat-window"></div>
+      <div class="chat-input">
+        <input type="text" id="messageInput" placeholder="Type a message..." />
+        <button id="sendBtn">Send</button>
+      </div>
+    </div>
+  </div>
+
+  <script src="client.js"></script>
+</body>
+</html>
