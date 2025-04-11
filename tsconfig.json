@@ -1,23 +1,52 @@
 {
   "compilerOptions": {
-    "target": "ES2022",                // Modern JavaScript features while maintaining good compatibility
-    "module": "nodenext",             
-    "moduleResolution": "Node",        // Resolve modules like Node.js does
-    "outDir": "./dist",                // Output directory for transpiled JS files
-    "rootDir": "./src",                // Root directory of your TypeScript source files
-    "esModuleInterop": true,           // Allow default imports from CommonJS modules
-    "forceConsistentCasingInFileNames": true, // Consistent casing in imports across platforms
-    "strict": true,                    // Enable all strict type-checking options
-    "skipLibCheck": true,              // Skip type checking for declaration files to speed up builds
-    "sourceMap": true,                 // Generate source maps for easier debugging
-    "resolveJsonModule": true,         // Allow importing JSON files
-    "declaration": true,               // Generate declaration files if you need to publish the package
-    "allowSyntheticDefaultImports": true, // Allow default imports even if module doesn't have a default export
-    "isolatedModules": true,           // Ensure each file can be safely transpiled without relying on others
-    "noImplicitAny": true, // Raise error on expressions and declarations with an implied `any` type
-    "allowJs": true
-  },
-  "include": ["src/**/*"],
-  "exclude": ["node_modules", "dist"]
-}
+    // Target environment: Modern browsers/Electron renderer
+    "target": "ES2020",
+    // Libraries available in the execution environment (browser + modern JS)
+    "lib": ["DOM", "DOM.Iterable", "ESNext"],
+    // Module system: Use ES modules for build tools like Webpack
+    "module": "ESNext",
+    // Module resolution strategy: Mimic Node.js resolution
+    "moduleResolution": "node",
+    // JSX processing: Use modern 'react-jsx' transform (no React import needed in files)
+    "jsx": "react-jsx",
 
+    // Type Checking Strictness: Enable all strict type-checking options
+    "strict": true,
+    // Interoperability: Allow default imports from CommonJS modules
+    "esModuleInterop": true,
+    // Interoperability: Allow default imports even if module doesn't have a default export
+    "allowSyntheticDefaultImports": true,
+    // Performance: Skip type checking of declaration files (.d.ts)
+    "skipLibCheck": true,
+    // Consistency: Enforce consistent file casing in imports
+    "forceConsistentCasingInFileNames": true,
+    // Features: Allow importing .json files as modules
+    "resolveJsonModule": true,
+    // Build Tool Compatibility: Ensure each file can be safely transpiled without relying on others
+    "isolatedModules": true,
+    // Build Tool Compatibility: Let build tool (Webpack/Babel) handle JS emission, TS only type checks
+    "noEmit": true,
+    // Project Structure: Disallow JavaScript files in the TS codebase
+    "allowJs": false,
+
+    // Path Aliases: Base directory for module resolution
+    "baseUrl": ".",
+    // Path Aliases: Define '@/*' as an alias for './src/*'
+    "paths": {
+      "@/*": ["./src/*"]
+    }
+  },
+  // Files to include in the TypeScript program
+  "include": [
+    "src/**/*" // Include all files within the src directory
+  ],
+  // Files/directories to exclude from compilation
+  "exclude": [
+    "node_modules", // Standard exclusion
+    "dist", // Exclude build output directory
+    "main.ts", // Exclude main process file (handled by tsconfig.main.json)
+    "preload.ts" // Exclude preload script file (handled by tsconfig.main.json)
+    // Add any test file patterns if necessary, e.g., "**/*.test.ts"
+  ]
+}

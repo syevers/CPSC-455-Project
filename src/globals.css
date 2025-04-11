@@ -1,0 +1,55 @@
+/* src/globals.css */
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+@layer base {
+  :root {
+    /* Define your color variables here - these are defaults for light mode */
+    /* Adjust these HSL values to match your desired theme (e.g., Slate from shadcn init) */
+    --background: 0 0% 100%; /* White */
+    --foreground: 222.2 84% 4.9%; /* Dark Slate */
+
+    --card: 0 0% 100%;
+    --card-foreground: 222.2 84% 4.9%;
+
+    --popover: 0 0% 100%;
+    --popover-foreground: 222.2 84% 4.9%;
+
+    --primary: 222.2 47.4% 11.2%; /* Default Primary (Dark Blue/Slate) */
+    --primary-foreground: 210 40% 98%; /* Light text on primary */
+
+    --secondary: 210 40% 96.1%; /* Light Gray */
+    --secondary-foreground: 222.2 47.4% 11.2%; /* Dark text on secondary */
+
+    --muted: 210 40% 96.1%;
+    --muted-foreground: 215.4 16.3% 46.9%; /* Grayish text */
+
+    --accent: 210 40% 96.1%;
+    --accent-foreground: 222.2 47.4% 11.2%;
+
+    --destructive: 0 84.2% 60.2%; /* Red */
+    --destructive-foreground: 210 40% 98%;
+
+    --border: 214.3 31.8% 91.4%; /* Light Gray Border */
+    --input: 214.3 31.8% 91.4%; /* Input Border */
+    --ring: 222.2 84% 4.9%; /* Focus Ring */
+
+    --radius: 0.5rem; /* Default border radius */
+  }
+
+  .dark {
+  }
+}
+
+@layer base {
+  * {
+    @apply border-border; /* Apply border color variable by default */
+  }
+  body {
+    @apply bg-background text-foreground; /* Apply background/foreground variables */
+    /* Ensure font smoothing is applied */
+    -webkit-font-smoothing: antialiased;
+    -moz-osx-font-smoothing: grayscale;
+  }
+}
