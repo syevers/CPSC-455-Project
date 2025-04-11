@@ -39,10 +39,7 @@ and this project adheres to [Semantic Versioning](http://semver.org/).
 ![image](https://github.com/user-attachments/assets/5fcbc0b1-423f-4ba8-b13b-7aa6ddac7e25)
 
 ## [0.2.1] - 2025-03-22
- - Updated GUI for user log in and resgister
  - Add secure for user's password by hash and salt
-![image](https://github.com/user-attachments/assets/6e05af3e-3b72-40f9-b03a-a08bb2dab745)
-![image](https://github.com/user-attachments/assets/94e4a6e5-0b83-4457-89c1-80097d461dfc)
 
 ## [0.2.2] - 2025-03-23
 - Add Brute-force protection
@@ -50,6 +47,10 @@ and this project adheres to [Semantic Versioning](http://semver.org/).
 ![image](https://github.com/user-attachments/assets/9e62e557-472b-4719-8039-8f3a1e2647df)
 ![image](https://github.com/user-attachments/assets/204e9d88-6173-4f22-aa5b-a83967028ab9)
 ![image](https://github.com/user-attachments/assets/72b8d1c8-b0ad-4468-9a8e-e2ac7175a42f)
+
+## [0.3.0] - 4-10-23
+- Created UI for client in React using SHADCN/UI components
+![image](https://github.com/user-attachments/assets/e9da98ed-f2cd-4f6e-9c5e-a6f7489bdcd8)
 
 
 
