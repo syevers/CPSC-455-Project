@@ -48,9 +48,13 @@ and this project adheres to [Semantic Versioning](http://semver.org/).
 ![image](https://github.com/user-attachments/assets/204e9d88-6173-4f22-aa5b-a83967028ab9)
 ![image](https://github.com/user-attachments/assets/72b8d1c8-b0ad-4468-9a8e-e2ac7175a42f)
 
-## [0.3.0] - 4-10-23
+## [0.3.0] - 2025-04-10
 - Created UI for client in React using SHADCN/UI components
 ![image](https://github.com/user-attachments/assets/e9da98ed-f2cd-4f6e-9c5e-a6f7489bdcd8)
 
+## [0.3.0] - 2025-04-12
+- Added direct messaging between users
+- Broadcasted (general chat) and direct messages are encrypted
+![SbJ1Vaz](https://github.com/user-attachments/assets/fd6d31d2-4c97-417d-b15a-f3f46b7797f3)
 
 
