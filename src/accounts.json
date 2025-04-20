@@ -1,4 +1,16 @@
 {
   "users": [
+    {
+      "username": "a",
+      "passwordHash": "$2b$10$KBwS5MSebC.Dn5/TGadiSeAs4O0I5XUyUPIt5kvgf56DGVHZEYHxi"
+    },
+    {
+      "username": "b",
+      "passwordHash": "$2b$10$JITgdOdoQ6yYJYfJKB30geR.lxtgReUUgaS5WPCs2jVmzN2cO9H9m"
+    },
+    {
+      "username": "c",
+      "passwordHash": "$2b$10$Xg04eXMlVjr4Azx9BCQNXegQsqXL.DIUXnrlVdr1pFY3rDxwPh6IC"
+    }
   ]
 }
