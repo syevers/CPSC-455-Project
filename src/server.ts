@@ -1,9 +1,9 @@
 import bcrypt from 'bcrypt';
-import crypto, { KeyObject } from 'crypto'; // Import crypto module
+import crypto, { KeyObject } from 'crypto';
 import { existsSync, readFileSync, writeFileSync } from 'fs';
 import type { IncomingMessage } from 'http';
 import https from 'https';
-import { Collection, Db, MongoClient } from 'mongodb'; // Import MongoDB types
+import { Collection, Db, MongoClient, Sort } from 'mongodb';
 import path from 'path';
 import { fileURLToPath } from 'url';
 import { WebSocket, WebSocketServer, type RawData } from 'ws';
@@ -13,17 +13,18 @@ const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 const PORT = 8080;
 const options = {
-  // Still use user certs for the HTTPS server itself
   key: readFileSync(path.join(__dirname, '../certs/private.pem')),
   cert: readFileSync(path.join(__dirname, '../certs/public.pem')),
 };
 const ACCOUNTS_PATH = path.join(__dirname, 'accounts.json');
-const RATE_LIMIT = 20;
-const RATE_LIMIT_BLOCK_DURATION = 10000;
-const HEARTBEAT_INTERVAL = 30000;
+const RATE_LIMIT = 20; // Messages per second
+const RATE_LIMIT_BLOCK_DURATION = 10000; // 10 seconds
+const HEARTBEAT_INTERVAL = 30000; // 30 seconds
 const SALT_ROUNDS = 10;
 const MAX_FILE_SIZE = 10 * 1024 * 1024;
 const MAX_CHUNK_SIZE = 64 * 1024;
+const MAX_HISTORY_MESSAGES = 200;
+const ALL_CHAT_KEY = 'All Chat';
 
 // WebSocket Server Initialization
 const server = https.createServer(options);
@@ -31,17 +32,16 @@ const wss = new WebSocketServer({ server });
 
 // Brute-Force Protection Constants
 const MAX_LOGIN_ATTEMPTS = 5;
-const LOGIN_BLOCK_DURATION = 60 * 1000;
-const ATTEMPT_WINDOW = 5 * 60 * 1000;
+const LOGIN_BLOCK_DURATION = 60 * 1000; // 1 minute
+const ATTEMPT_WINDOW = 5 * 60 * 1000; // 5 minutes
 
 // MongoDB Setup
-// REPLACE WITH YOUR ACTUAL MONGODB CONNECTION STRING
 const MONGODB_URI = process.env.MONGODB_URI || 'mongodb://localhost:27017';
 const MONGODB_DB_NAME = 'secureChat';
-const MONGODB_LOG_COLLECTION = 'chatLogs';
+const MONGODB_HISTORY_COLLECTION = 'messageHistory';
 
 let db: Db | null = null;
-let chatLogCollection: Collection<ChatLogDocument> | null = null;
+let messageHistoryCollection: Collection<MessageHistoryDocument> | null = null;
 
 // Server Keys
 let serverPrivateKey: KeyObject | null = null;
@@ -55,50 +55,54 @@ interface UserAccount {
 interface AccountsData {
   users: UserAccount[];
 }
-// Interface for MongoDB log documents
-interface ChatLogDocument {
+interface MessageHistoryDocument {
   timestamp: Date;
-  type: 'broadcast' | 'private' | 'file_request' | 'file_accept' | 'file_reject'; // Add more types as needed
   sender: string;
-  recipient?: string; // Optional for broadcast/system/file events
-  messageContent?: string; // Store decrypted message content for text messages
-  fileInfo?: { name: string; size: number }; // Optional for file transfers
-  ipAddress: string; // Log sender's IP
+  recipient?: string;
+  isBroadcast: boolean;
+  messageContent: string;
 }
 
 // Message Types
 enum ServerMessageType {
   SYSTEM = 'system',
   USER_LIST = 'userList',
-  SERVER_PUBLIC_KEY = 'server_public_key', // For sending server's key to client
-  RECEIVE_MESSAGE = 'receive_message', // Generic message receipt type
-  RECEIVE_PUBLIC_KEY = 'receive_public_key', // For receiving user keys
+  SERVER_PUBLIC_KEY = 'server_public_key',
+  RECEIVE_MESSAGE = 'receive_message',
+  RECEIVE_PUBLIC_KEY = 'receive_public_key',
   PONG = 'pong',
   PING = 'ping',
   INCOMING_FILE_REQUEST = 'incoming_file_request',
   FILE_ACCEPT_NOTICE = 'file_accept_notice',
   FILE_REJECT_NOTICE = 'file_reject_notice',
   FILE_CHUNK_RECEIVE = 'file_chunk_receive',
+  RECEIVE_HISTORY = 'receive_history',
+  USER_TYPING = 'user_typing',
+  USER_STOPPED_TYPING = 'user_stopped_typing',
 }
 
 enum ClientMessageType {
   LOGIN = 'login',
   LOGOUT = 'logout',
-  SEND_MESSAGE = 'send_message', // Generic message sending type
-  SHARE_PUBLIC_KEY = 'share_public_key', // Client shares its key
-  REQUEST_PUBLIC_KEY = 'request_public_key', // Client requests another user's key (for files)
+  SEND_MESSAGE = 'send_message',
+  SHARE_PUBLIC_KEY = 'share_public_key',
+  REQUEST_PUBLIC_KEY = 'request_public_key',
   PING = 'ping',
   PONG = 'pong',
   FILE_TRANSFER_REQUEST = 'file_transfer_request',
   FILE_TRANSFER_ACCEPT = 'file_transfer_accept',
   FILE_TRANSFER_REJECT = 'file_transfer_reject',
   FILE_CHUNK = 'file_chunk',
+  REQUEST_HISTORY = 'request_history',
+  START_TYPING = 'start_typing',
+  STOP_TYPING = 'stop_typing',
 }
 
 // Message Interfaces
 interface BaseMessage {
   type: ClientMessageType | ServerMessageType;
 }
+
 interface LoginMessage extends BaseMessage {
   type: ClientMessageType.LOGIN;
   username: string;
@@ -108,7 +112,6 @@ interface LogoutMessage extends BaseMessage {
   type: ClientMessageType.LOGOUT;
   username?: string;
 }
-// Client shares its key (SPKI Base64 format)
 interface SharePublicKeyMessage extends BaseMessage {
   type: ClientMessageType.SHARE_PUBLIC_KEY;
   publicKey: string;
@@ -120,32 +123,63 @@ interface RequestPublicKeyMessage extends BaseMessage {
 interface PongMessage extends BaseMessage {
   type: ClientMessageType.PONG;
 }
-
-// Message sent from Client -> Server
+interface RequestHistoryMessage extends BaseMessage {
+  type: ClientMessageType.REQUEST_HISTORY;
+}
 interface ClientSendMessage extends BaseMessage {
   type: ClientMessageType.SEND_MESSAGE;
-  recipient?: string; // Undefined or null for broadcast
-  payload: {
-    iv: string; // AES IV (base64)
-    encryptedKey: string; // AES key encrypted with SERVER's public key (base64)
-    ciphertext: string; // Message content encrypted with AES key (base64)
-  };
+  recipient?: string;
+  payload: { iv: string; encryptedKey: string; ciphertext: string };
 }
-// Message sent from Server -> Client
+interface StartTypingMessage extends BaseMessage {
+  type: ClientMessageType.START_TYPING;
+  recipient?: string;
+}
+interface StopTypingMessage extends BaseMessage {
+  type: ClientMessageType.STOP_TYPING;
+  recipient?: string;
+}
+
+// Server -> Client
+interface SystemMessage extends BaseMessage {
+  type: ServerMessageType.SYSTEM;
+  content: string;
+}
+interface UserListMessage extends BaseMessage {
+  type: ServerMessageType.USER_LIST;
+  users: string[];
+}
+interface ServerPublicKeyMessage extends BaseMessage {
+  type: ServerMessageType.SERVER_PUBLIC_KEY;
+  publicKey: string;
+}
 interface ServerReceiveMessage extends BaseMessage {
   type: ServerMessageType.RECEIVE_MESSAGE;
   sender: string;
   isBroadcast: boolean;
-  payload: {
-    iv: string; // AES IV (base64)
-    encryptedKey: string; // AES key encrypted with RECIPIENT's public key (base64)
-    ciphertext: string; // Message content encrypted with AES key (base64)
-  };
+  payload: { iv: string; encryptedKey: string; ciphertext: string };
 }
-// Server sends its public key (PEM format)
-interface ServerPublicKeyMessage extends BaseMessage {
-  type: ServerMessageType.SERVER_PUBLIC_KEY;
-  publicKey: string; // PEM format
+interface ReceivePublicKeyServerMessage extends BaseMessage {
+  type: ServerMessageType.RECEIVE_PUBLIC_KEY;
+  username: string;
+  publicKey: string;
+}
+interface PingMessage extends BaseMessage {
+  type: ServerMessageType.PING;
+}
+interface ReceiveHistoryMessage extends BaseMessage {
+  type: ServerMessageType.RECEIVE_HISTORY;
+  history: PersistedChatHistories;
+}
+interface UserTypingMessage extends BaseMessage {
+  type: ServerMessageType.USER_TYPING;
+  sender: string;
+  recipient?: string;
+}
+interface UserStoppedTypingMessage extends BaseMessage {
+  type: ServerMessageType.USER_STOPPED_TYPING;
+  sender: string;
+  recipient?: string;
 }
 
 // File Transfer Interfaces
@@ -179,13 +213,11 @@ interface FileChunkMessage extends BaseMessage {
   chunkIndex: number;
   isLastChunk: boolean;
 }
-
 interface IncomingFileRequestMessage extends BaseMessage {
   type: ServerMessageType.INCOMING_FILE_REQUEST;
   sender: string;
   fileInfo: FileInfo;
 }
-
 interface FileAcceptNoticeMessage extends BaseMessage {
   type: ServerMessageType.FILE_ACCEPT_NOTICE;
   recipient: string;
@@ -205,20 +237,17 @@ interface FileChunkReceiveMessage extends BaseMessage {
   isLastChunk: boolean;
 }
 
-// Other Server -> Client Messages
-interface SystemMessage extends BaseMessage {
-  type: ServerMessageType.SYSTEM;
+// History Structure Interface
+interface PersistedDisplayMessage {
+  type: 'system' | 'chat' | 'my_chat' | 'error';
   content: string;
+  sender?: string;
+  recipient?: string;
+  timestamp?: number;
+  isEncrypted?: boolean;
 }
-interface UserListMessage extends BaseMessage {
-  type: ServerMessageType.USER_LIST;
-  users: string[];
-}
-// Server sends user's public key
-interface ReceivePublicKeyServerMessage extends BaseMessage {
-  type: ServerMessageType.RECEIVE_PUBLIC_KEY;
-  username: string;
-  publicKey: string;
+interface PersistedChatHistories {
+  [peerUsernameOrAllChat: string]: PersistedDisplayMessage[];
 }
 
 // Type Guards
@@ -230,7 +259,7 @@ function isLogoutMessage(msg: any): msg is LogoutMessage {
 }
 function isSharePublicKeyMessage(msg: any): msg is SharePublicKeyMessage {
   return msg?.type === ClientMessageType.SHARE_PUBLIC_KEY && typeof msg.publicKey === 'string';
-} // Basic check
+}
 function isRequestPublicKeyMessage(msg: any): msg is RequestPublicKeyMessage {
   return msg?.type === ClientMessageType.REQUEST_PUBLIC_KEY && typeof msg.username === 'string';
 }
@@ -246,7 +275,6 @@ function isClientSendMessage(msg: any): msg is ClientSendMessage {
     (msg.recipient === undefined || msg.recipient === null || typeof msg.recipient === 'string')
   );
 }
-// File Transfer Guards
 function isFileTransferRequest(msg: any): msg is FileTransferRequestMessage {
   return (
     msg?.type === ClientMessageType.FILE_TRANSFER_REQUEST &&
@@ -258,7 +286,6 @@ function isFileTransferRequest(msg: any): msg is FileTransferRequestMessage {
     typeof msg.fileInfo?.encryptedKey === 'string'
   );
 }
-
 function isFileTransferAccept(msg: any): msg is FileTransferAcceptMessage {
   return (
     msg?.type === ClientMessageType.FILE_TRANSFER_ACCEPT &&
@@ -267,7 +294,6 @@ function isFileTransferAccept(msg: any): msg is FileTransferAcceptMessage {
     typeof msg.fileInfo?.size === 'number'
   );
 }
-
 function isFileTransferReject(msg: any): msg is FileTransferRejectMessage {
   return (
     msg?.type === ClientMessageType.FILE_TRANSFER_REJECT &&
@@ -275,7 +301,6 @@ function isFileTransferReject(msg: any): msg is FileTransferRejectMessage {
     typeof msg.fileInfo?.name === 'string'
   );
 }
-
 function isFileChunk(msg: any): msg is FileChunkMessage {
   return (
     msg?.type === ClientMessageType.FILE_CHUNK &&
@@ -286,81 +311,82 @@ function isFileChunk(msg: any): msg is FileChunkMessage {
     typeof msg.isLastChunk === 'boolean'
   );
 }
+function isRequestHistoryMessage(msg: any): msg is RequestHistoryMessage {
+  return msg?.type === ClientMessageType.REQUEST_HISTORY;
+}
+// Typing indicator guards
+function isStartTypingMessage(msg: any): msg is StartTypingMessage {
+  return (
+    msg?.type === ClientMessageType.START_TYPING &&
+    (msg.recipient === undefined || msg.recipient === null || typeof msg.recipient === 'string')
+  );
+}
+function isStopTypingMessage(msg: any): msg is StopTypingMessage {
+  return (
+    msg?.type === ClientMessageType.STOP_TYPING &&
+    (msg.recipient === undefined || msg.recipient === null || typeof msg.recipient === 'string')
+  );
+}
 
 // Crypto Helper Functions
-
-// Decrypts data using RSA-OAEP with the server's private key
 function decryptWithServerKey(encryptedDataB64: string): Buffer | null {
   if (!serverPrivateKey) {
     console.error('[CRYPTO] Server private key not loaded.');
     return null;
   }
   try {
-    const encryptedBuffer = Buffer.from(encryptedDataB64, 'base64');
-    const decryptedBuffer = crypto.privateDecrypt(
+    const eb = Buffer.from(encryptedDataB64, 'base64');
+    return crypto.privateDecrypt(
       {
         key: serverPrivateKey,
         padding: crypto.constants.RSA_PKCS1_OAEP_PADDING,
         oaepHash: 'sha256',
       },
-      encryptedBuffer
+      eb
     );
-    return decryptedBuffer;
-  } catch (error) {
-    console.error('[CRYPTO] RSA decryption with server key failed:', error);
+  } catch (e) {
+    console.error('[CRYPTO] RSA decryption with server key failed:', e);
     return null;
   }
 }
-
-// Converts SPKI Base64 key to PEM format
 function spkiBase64ToPem(spkiBase64: string): string {
-  // Add PEM headers and footers, and wrap lines every 64 characters
-  const pemContents = spkiBase64.match(/.{1,64}/g)?.join('\n') || '';
-  return `-----BEGIN PUBLIC KEY-----\n${pemContents}\n-----END PUBLIC KEY-----`;
+  const pc = spkiBase64.match(/.{1,64}/g)?.join('\n') || '';
+  return `-----BEGIN PUBLIC KEY-----\n${pc}\n-----END PUBLIC KEY-----`;
 }
-
-// Encrypts data using RSA-OAEP with a recipient's public key
 function encryptWithRecipientKey(
   recipientPublicKeySpkiBase64: string,
   dataBuffer: Buffer
 ): string | null {
   try {
-    // Convert SPKI Base64 to PEM format for Node's crypto module
-    const recipientPublicKeyPem = spkiBase64ToPem(recipientPublicKeySpkiBase64);
-    const publicKey = crypto.createPublicKey(recipientPublicKeyPem);
-    const encryptedBuffer = crypto.publicEncrypt(
-      {
-        key: publicKey,
-        padding: crypto.constants.RSA_PKCS1_OAEP_PADDING,
-        oaepHash: 'sha256',
-      },
+    const pkPem = spkiBase64ToPem(recipientPublicKeySpkiBase64);
+    const pubKey = crypto.createPublicKey(pkPem);
+    const eb = crypto.publicEncrypt(
+      { key: pubKey, padding: crypto.constants.RSA_PKCS1_OAEP_PADDING, oaepHash: 'sha256' },
       dataBuffer
     );
-    return encryptedBuffer.toString('base64');
-  } catch (error) {
-    console.error('[CRYPTO] RSA encryption with recipient key failed:', error);
+    return eb.toString('base64');
+  } catch (e) {
+    console.error('[CRYPTO] RSA encryption with recipient key failed:', e);
     return null;
   }
 }
-
-// Decrypts message content using AES-GCM.
 function decryptAesGcm(aesKey: Buffer, ivB64: string, ciphertextB64: string): string | null {
   try {
     const iv = Buffer.from(ivB64, 'base64');
-    const ciphertext = Buffer.from(ciphertextB64, 'base64');
-    const authTagLength = 16;
-    if (ciphertext.length < authTagLength) {
+    const ct = Buffer.from(ciphertextB64, 'base64');
+    const atl = 16;
+    if (ct.length < atl) {
       throw new Error('Invalid ciphertext length for GCM.');
     }
-    const encryptedPart = ciphertext.subarray(0, ciphertext.length - authTagLength);
-    const authTag = ciphertext.subarray(ciphertext.length - authTagLength);
-    const decipher = crypto.createDecipheriv('aes-256-gcm', aesKey, iv);
-    decipher.setAuthTag(authTag);
-    let decrypted = decipher.update(encryptedPart, undefined, 'utf8');
-    decrypted += decipher.final('utf8');
-    return decrypted;
-  } catch (error) {
-    console.error('[CRYPTO] AES-GCM decryption failed:', error);
+    const ep = ct.subarray(0, ct.length - atl);
+    const at = ct.subarray(ct.length - atl);
+    const d = crypto.createDecipheriv('aes-256-gcm', aesKey, iv);
+    d.setAuthTag(at);
+    let dec = d.update(ep, undefined, 'utf8');
+    dec += d.final('utf8');
+    return dec;
+  } catch (e) {
+    console.error('[CRYPTO] AES-GCM decryption failed:', e);
     return null;
   }
 }
@@ -380,7 +406,6 @@ function initializeAccountsFile(): AccountsData | null {
   }
   return null;
 }
-
 function loadAccounts(): AccountsData {
   try {
     const i = initializeAccountsFile();
@@ -499,20 +524,74 @@ function checkRateLimit(ws: WebSocket): boolean {
   return true;
 }
 
-// Logging Function for database
-async function logToMongo(logData: Omit<ChatLogDocument, 'timestamp'>): Promise<void> {
-  if (!chatLogCollection) {
-    console.error('[SRV-LOG] DB collection not available. Cannot log message.');
+// Database Interaction Functions
+async function saveMessageToHistory(
+  messageData: Omit<MessageHistoryDocument, 'timestamp'>
+): Promise<void> {
+  if (!messageHistoryCollection) {
+    console.error('[SRV-DB] History collection not available. Cannot save message.');
     return;
   }
-  const documentToInsert: ChatLogDocument = { ...logData, timestamp: new Date() };
+  const doc: MessageHistoryDocument = { ...messageData, timestamp: new Date() };
   try {
-    const result = await chatLogCollection.insertOne(documentToInsert);
-    if (!result.acknowledged) {
-      console.warn('[SRV-LOG] DB insert not acknowledged for sender:', logData.sender);
+    const r = await messageHistoryCollection.insertOne(doc);
+    if (!r.acknowledged) {
+      console.warn('[SRV-DB] DB insert not acknowledged for sender:', messageData.sender);
     }
-  } catch (error) {
-    console.error('[SRV-LOG] Error logging message to DB:', error, 'Data:', documentToInsert);
+  } catch (e) {
+    console.error('[SRV-DB] Error saving message to DB:', e, 'Data:', doc);
+  }
+}
+async function fetchUserHistory(username: string): Promise<PersistedChatHistories> {
+  const history: PersistedChatHistories = { [ALL_CHAT_KEY]: [] };
+  if (!messageHistoryCollection) {
+    console.error(
+      `[SRV-DB] History collection not available. Cannot fetch history for ${username}.`
+    );
+    return history;
+  }
+  try {
+    const query = { $or: [{ sender: username }, { recipient: username }, { isBroadcast: true }] };
+    const sort: Sort = { timestamp: -1 };
+    const dbMessages = await messageHistoryCollection
+      .find(query)
+      .sort(sort)
+      .limit(MAX_HISTORY_MESSAGES)
+      .toArray();
+    dbMessages.reverse().forEach((msg) => {
+      let messageType: PersistedDisplayMessage['type'] = 'chat';
+      if (msg.sender === username) {
+        messageType = 'my_chat';
+      }
+      const displayMsg: PersistedDisplayMessage = {
+        type: messageType,
+        content: msg.messageContent,
+        sender: msg.sender,
+        recipient: msg.sender === username ? msg.recipient : undefined,
+        timestamp: msg.timestamp.getTime(),
+        isEncrypted: true,
+      };
+      let peerKey: string;
+      if (msg.isBroadcast) {
+        peerKey = ALL_CHAT_KEY;
+      } else if (msg.sender === username) {
+        peerKey = msg.recipient!;
+      } else {
+        peerKey = msg.sender;
+      }
+      if (!history[peerKey]) {
+        history[peerKey] = [];
+      }
+      history[peerKey].push(displayMsg);
+    });
+    if (!history[ALL_CHAT_KEY]) {
+      history[ALL_CHAT_KEY] = [];
+    }
+    console.log(`[SRV-DB] Fetched ${dbMessages.length} history messages for ${username}.`);
+    return history;
+  } catch (e) {
+    console.error(`[SRV-DB] Error fetching history for ${username}:`, e);
+    return history;
   }
 }
 
@@ -563,8 +642,6 @@ function handleDisconnect(ws: WebSocket) {
   if (un) {
     clientsByName.delete(un);
     publicKeys.delete(un);
-    loginFailureCounts.delete(un);
-    loginBlockedUsers.delete(un);
     wasLoggedIn = true;
     console.log(`[SRV] ${un} removed from active users.`);
   }
@@ -578,18 +655,18 @@ function handleDisconnect(ws: WebSocket) {
 }
 function startHeartbeat(ws: WebSocket) {
   stopHeartbeat(ws);
-  const clientData = clientDataMap.get(ws);
-  const clientId = clientData?.username || ws.toString();
-  if (!clientData) {
-    console.error(`[SRV] Cannot start heartbeat for ${clientId}: client data not found.`);
+  const cd = clientDataMap.get(ws);
+  const cid = cd?.username || ws.toString();
+  if (!cd) {
+    console.error(`[SRV] Cannot start heartbeat for ${cid}: client data not found.`);
     return;
   }
-  console.log(`[SRV] Starting heartbeat for ${clientId}`);
-  clientData.isAlive = true;
-  const intervalId = setInterval(() => {
-    const currentClientData = clientDataMap.get(ws);
-    const currentClientId = currentClientData?.username || ws.toString();
-    if (!currentClientData) {
+  console.log(`[SRV] Starting heartbeat for ${cid}`);
+  cd.isAlive = true;
+  const intId = setInterval(() => {
+    const ccd = clientDataMap.get(ws);
+    const ccid = ccd?.username || ws.toString();
+    if (!ccd) {
       console.warn(`[SRV] Heartbeat: Client data missing (WS ${ws.toString()}), stopping.`);
       if (heartbeatMap.has(ws)) {
         clearInterval(heartbeatMap.get(ws)!);
@@ -597,30 +674,27 @@ function startHeartbeat(ws: WebSocket) {
       }
       return;
     }
-    if (currentClientData.isAlive === false) {
-      console.log(`[SRV] Heartbeat failed (no pong) for ${currentClientId}. Terminating.`);
+    if (ccd.isAlive === false) {
+      console.log(`[SRV] Heartbeat failed (no pong) for ${ccid}. Terminating.`);
       handleDisconnect(ws);
       ws.terminate();
       return;
     }
-    currentClientData.isAlive = false;
+    ccd.isAlive = false;
     try {
       if (ws.readyState === WebSocket.OPEN) {
-        const pingMsg = { type: ServerMessageType.PING };
-        ws.send(JSON.stringify(pingMsg));
+        ws.send(JSON.stringify({ type: ServerMessageType.PING }));
       } else {
-        console.log(
-          `[SRV] Heartbeat: WS not open during ping for ${currentClientId}, cleaning up.`
-        );
+        console.log(`[SRV] Heartbeat: WS not open during ping for ${ccid}, cleaning up.`);
         handleDisconnect(ws);
       }
-    } catch (sendError) {
-      console.error(`[SRV] Failed send PING to ${currentClientId}:`, sendError);
+    } catch (se) {
+      console.error(`[SRV] Failed send PING to ${ccid}:`, se);
       handleDisconnect(ws);
       ws.terminate();
     }
   }, HEARTBEAT_INTERVAL);
-  heartbeatMap.set(ws, intervalId);
+  heartbeatMap.set(ws, intId);
 }
 function stopHeartbeat(ws: WebSocket) {
   if (heartbeatMap.has(ws)) {
@@ -635,16 +709,22 @@ async function connectToMongo() {
     const client = new MongoClient(MONGODB_URI);
     await client.connect();
     db = client.db(MONGODB_DB_NAME);
-    chatLogCollection = db.collection(MONGODB_LOG_COLLECTION);
-    await chatLogCollection.createIndex({ timestamp: -1 });
-    await chatLogCollection.createIndex({ sender: 1 });
-    await chatLogCollection.createIndex({ recipient: 1 });
-    await chatLogCollection.createIndex({ type: 1 });
+    messageHistoryCollection = db.collection(MONGODB_HISTORY_COLLECTION);
+    await messageHistoryCollection.createIndex({ timestamp: -1 });
+    await messageHistoryCollection.createIndex({ sender: 1 });
+    await messageHistoryCollection.createIndex({ recipient: 1 });
+    await messageHistoryCollection.createIndex({ isBroadcast: 1 });
+    await messageHistoryCollection.createIndex({
+      sender: 1,
+      recipient: 1,
+      isBroadcast: 1,
+      timestamp: -1,
+    });
     console.log(
-      `[SRV-DB] Successfully connected to MongoDB: ${MONGODB_DB_NAME}/${MONGODB_LOG_COLLECTION}`
+      `[SRV-DB] Successfully connected to MongoDB: ${MONGODB_DB_NAME}/${MONGODB_HISTORY_COLLECTION}`
     );
-  } catch (error) {
-    console.error('[SRV-DB] Failed to connect to MongoDB:', error);
+  } catch (e) {
+    console.error('[SRV-DB] Failed to connect to MongoDB:', e);
     process.exit(1);
   }
 }
@@ -653,13 +733,11 @@ async function connectToMongo() {
 interface ClientData {
   username: string;
   ipAddress: string;
-  publicKeySpkiBase64?: string; // Store user's public key (SPKI Base64 format)
+  publicKeySpkiBase64?: string;
   isAlive?: boolean;
 }
-
 const clientDataMap = new Map<WebSocket, ClientData>();
 const clientsByName = new Map<string, WebSocket>();
-// Store user public keys as SPKI Base64
 const publicKeys = new Map<string, string>();
 const heartbeatMap = new Map<WebSocket, NodeJS.Timeout>();
 const messageTimestamps = new Map<WebSocket, number[]>();
@@ -667,35 +745,29 @@ const rateLimitBlockedUsers = new Map<WebSocket, number>();
 const loginFailureCounts = new Map<string, { count: number; lastAttempt: number }>();
 const loginBlockedUsers = new Map<string, number>();
 
-// Main Server Startup Logic
+//Main Server Startup Logic
 async function startServer() {
   console.log(`[SRV] Initializing...`);
-  // Load server keys
   try {
-    const privateKeyPath = path.join(__dirname, '../certs/server_private.pem');
-    const publicKeyPath = path.join(__dirname, '../certs/server_public.pem');
-    if (!existsSync(privateKeyPath) || !existsSync(publicKeyPath)) {
+    const privPath = path.join(__dirname, '../certs/server_private.pem');
+    const pubPath = path.join(__dirname, '../certs/server_public.pem');
+    if (!existsSync(privPath) || !existsSync(pubPath)) {
       console.error(`[FATAL] Server key pair not found in certs/ directory.`);
       process.exit(1);
     }
-    const privateKeyPem = readFileSync(privateKeyPath, 'utf8');
-    serverPublicKeyPem = readFileSync(publicKeyPath, 'utf8');
-    serverPrivateKey = crypto.createPrivateKey(privateKeyPem);
+    const privPem = readFileSync(privPath, 'utf8');
+    serverPublicKeyPem = readFileSync(pubPath, 'utf8');
+    serverPrivateKey = crypto.createPrivateKey(privPem);
     console.log('[SRV] Server key pair loaded successfully.');
-  } catch (error) {
-    console.error('[SRV] Failed to load server key pair:', error);
+  } catch (e) {
+    console.error('[SRV] Failed to load server key pair:', e);
     process.exit(1);
   }
-
-  // Connect to MongoDB
   console.log(`[SRV] Connecting to MongoDB...`);
   await connectToMongo();
-
-  // Load accounts
   loadAccounts();
   console.log(`[SRV] User accounts loaded.`);
   console.log(`[SRV] Initialization complete.`);
-
   server.listen(PORT, '127.0.0.1', () => {
     console.log(`[SRV] Secure WebSocket Server running on wss://127.0.0.1:${PORT}`);
   });
@@ -713,7 +785,8 @@ wss.on('connection', (ws: WebSocket, req: IncomingMessage) => {
     handleDisconnect(ws);
   });
 
-  ws.on('message', (data: RawData) => {
+  // WebSocket Message Handler
+  ws.on('message', async (data: RawData) => {
     const clientInfo = clientDataMap.get(ws);
     const clientIdForLog = clientInfo?.username || `WS ${wsId} (IP: ${ipAddress})`;
     const messageString = data.toString();
@@ -787,11 +860,11 @@ wss.on('connection', (ws: WebSocket, req: IncomingMessage) => {
       }
       const now = Date.now();
       if (loginBlockedUsers.has(username) && now < loginBlockedUsers.get(username)!) {
-        const remainingTime = Math.ceil((loginBlockedUsers.get(username)! - now) / 1000);
+        const rt = Math.ceil((loginBlockedUsers.get(username)! - now) / 1000);
         console.log(`[SRV] Login attempt rejected for blocked user: ${username}`);
         sendToClient(ws, {
           type: ServerMessageType.SYSTEM,
-          content: `Login failed: Account temporarily blocked. Try again in ${remainingTime} seconds.`,
+          content: `Login failed: Account temporarily blocked. Try again in ${rt} seconds.`,
         });
         return;
       }
@@ -820,18 +893,18 @@ wss.on('connection', (ws: WebSocket, req: IncomingMessage) => {
         try {
           sendToClient(ws, { type: ServerMessageType.SYSTEM, content: 'Login successful!' });
           console.log(`[SRV] Login success message sent to ${username}.`);
+          if (serverPublicKeyPem) {
+            sendToClient(ws, {
+              type: ServerMessageType.SERVER_PUBLIC_KEY,
+              publicKey: serverPublicKeyPem,
+            });
+          } else {
+            console.error('[SRV] Server public key not available to send to client!');
+          }
         } catch (e) {
-          console.error(`[SRV] Error sending login success message to ${username}:`, e);
+          console.error(`[SRV] Error sending login success/key to ${username}:`, e);
           handleDisconnect(ws);
           return;
-        }
-        if (serverPublicKeyPem) {
-          sendToClient(ws, {
-            type: ServerMessageType.SERVER_PUBLIC_KEY,
-            publicKey: serverPublicKeyPem,
-          });
-        } else {
-          console.error('[SRV] Server public key not available to send to client!');
         }
         try {
           broadcastUserList();
@@ -847,22 +920,18 @@ wss.on('connection', (ws: WebSocket, req: IncomingMessage) => {
         }
       } else {
         console.log(`[SRV] Login FAILED for: ${username}.`);
-        const failureRecord = loginFailureCounts.get(username) || { count: 0, lastAttempt: 0 };
-        if (now - failureRecord.lastAttempt > ATTEMPT_WINDOW) {
-          failureRecord.count = 0;
+        const fr = loginFailureCounts.get(username) || { count: 0, lastAttempt: 0 };
+        if (now - fr.lastAttempt > ATTEMPT_WINDOW) {
+          fr.count = 0;
         }
-        failureRecord.count++;
-        failureRecord.lastAttempt = now;
-        loginFailureCounts.set(username, failureRecord);
-        console.log(
-          `[SRV] Login failure count for ${username}: ${failureRecord.count}/${MAX_LOGIN_ATTEMPTS}`
-        );
-        if (failureRecord.count >= MAX_LOGIN_ATTEMPTS) {
-          const unblockTime = now + LOGIN_BLOCK_DURATION;
-          loginBlockedUsers.set(username, unblockTime);
-          console.log(
-            `[SRV] Blocking user ${username} until ${new Date(unblockTime).toISOString()}`
-          );
+        fr.count++;
+        fr.lastAttempt = now;
+        loginFailureCounts.set(username, fr);
+        console.log(`[SRV] Login failure count for ${username}: ${fr.count}/${MAX_LOGIN_ATTEMPTS}`);
+        if (fr.count >= MAX_LOGIN_ATTEMPTS) {
+          const ut = now + LOGIN_BLOCK_DURATION;
+          loginBlockedUsers.set(username, ut);
+          console.log(`[SRV] Blocking user ${username} until ${new Date(ut).toISOString()}`);
           sendToClient(ws, {
             type: ServerMessageType.SYSTEM,
             content: `Login failed: Too many attempts. Account blocked for ${
@@ -889,7 +958,7 @@ wss.on('connection', (ws: WebSocket, req: IncomingMessage) => {
       return;
     }
     const currentUsername = clientInfo.username;
-    const currentUserIp = clientInfo.ipAddress;
+    // const currentUserIp = clientInfo.ipAddress; // Available if needed
 
     // Handle Logout
     if (isLogoutMessage(parsedData)) {
@@ -905,30 +974,20 @@ wss.on('connection', (ws: WebSocket, req: IncomingMessage) => {
 
     // Handle Share Public Key
     if (isSharePublicKeyMessage(parsedData)) {
-      const userPublicKeySpkiBase64 = parsedData.publicKey;
+      const pk = parsedData.publicKey;
       console.log(`[SRV] Received public key (SPKI Base64) from ${currentUsername}`);
-      if (
-        userPublicKeySpkiBase64 &&
-        typeof userPublicKeySpkiBase64 === 'string' &&
-        userPublicKeySpkiBase64.length > 50 &&
-        /^[A-Za-z0-9+/=]+$/.test(userPublicKeySpkiBase64)
-      ) {
-        clientInfo.publicKeySpkiBase64 = userPublicKeySpkiBase64; // Store SPKI Base64
-        publicKeys.set(currentUsername, userPublicKeySpkiBase64); // Store in global map
+      if (pk && typeof pk === 'string' && pk.length > 50 && /^[A-Za-z0-9+/=]+$/.test(pk)) {
+        clientInfo.publicKeySpkiBase64 = pk;
+        publicKeys.set(currentUsername, pk);
         console.log(`[SRV] User public key stored for ${currentUsername}. Broadcasting...`);
-        // Broadcast the key in the same format it was received
-        const messageToSend: ReceivePublicKeyServerMessage = {
+        const msg: ReceivePublicKeyServerMessage = {
           type: ServerMessageType.RECEIVE_PUBLIC_KEY,
           username: currentUsername,
-          publicKey: userPublicKeySpkiBase64, // Send SPKI Base64
+          publicKey: pk,
         };
-        wss.clients.forEach((otherClient) => {
-          if (
-            otherClient !== ws &&
-            otherClient.readyState === WebSocket.OPEN &&
-            clientDataMap.has(otherClient)
-          ) {
-            sendToClient(otherClient, messageToSend);
+        wss.clients.forEach((oc) => {
+          if (oc !== ws && oc.readyState === WebSocket.OPEN && clientDataMap.has(oc)) {
+            sendToClient(oc, msg);
           }
         });
         console.log(`[SRV] Finished broadcasting ${currentUsername}'s public key.`);
@@ -944,23 +1003,41 @@ wss.on('connection', (ws: WebSocket, req: IncomingMessage) => {
 
     // Handle Request Public Key
     if (isRequestPublicKeyMessage(parsedData)) {
-      const targetUsername = parsedData.username;
-      console.log(`[SRV] ${currentUsername} requested public key for ${targetUsername}`);
-      const targetKeySpkiBase64 = publicKeys.get(targetUsername); // Get SPKI Base64
-      if (targetKeySpkiBase64) {
-        const messageToSend: ReceivePublicKeyServerMessage = {
+      const tu = parsedData.username;
+      console.log(`[SRV] ${currentUsername} requested public key for ${tu}`);
+      const tk = publicKeys.get(tu);
+      if (tk) {
+        const msg: ReceivePublicKeyServerMessage = {
           type: ServerMessageType.RECEIVE_PUBLIC_KEY,
-          username: targetUsername,
-          publicKey: targetKeySpkiBase64, // Send SPKI Base64
+          username: tu,
+          publicKey: tk,
         };
-        sendToClient(ws, messageToSend);
+        sendToClient(ws, msg);
       } else {
         console.log(
-          `[SRV] Key for '${targetUsername}' not found in response to request from ${currentUsername}.`
+          `[SRV] Key for '${tu}' not found in response to request from ${currentUsername}.`
         );
         sendToClient(ws, {
           type: ServerMessageType.SYSTEM,
-          content: `Public key for user '${targetUsername}' not found or user is offline.`,
+          content: `Public key for user '${tu}' not found or user is offline.`,
+        });
+      }
+      return;
+    }
+
+    // Handle Request History
+    if (isRequestHistoryMessage(parsedData)) {
+      console.log(`[SRV] Received history request from ${currentUsername}`);
+      try {
+        const uh = await fetchUserHistory(currentUsername);
+        const hm: ReceiveHistoryMessage = { type: ServerMessageType.RECEIVE_HISTORY, history: uh };
+        sendToClient(ws, hm);
+        console.log(`[SRV] Sent history to ${currentUsername}`);
+      } catch (e) {
+        console.error(`[SRV] Error preparing/sending history for ${currentUsername}:`, e);
+        sendToClient(ws, {
+          type: ServerMessageType.SYSTEM,
+          content: '[SRV Error] Could not retrieve chat history.',
         });
       }
       return;
@@ -969,12 +1046,10 @@ wss.on('connection', (ws: WebSocket, req: IncomingMessage) => {
     // Handle Intermediary Encrypted Messages
     if (isClientSendMessage(parsedData)) {
       const { recipient, payload } = parsedData;
-      const { iv, encryptedKey: encryptedKeyForServerB64, ciphertext: ciphertextB64 } = payload;
-      const isBroadcast = !recipient;
-
-      // Decrypt AES key using Server's Private Key
-      const aesKeyBuffer = decryptWithServerKey(encryptedKeyForServerB64);
-      if (!aesKeyBuffer) {
+      const { iv, encryptedKey: ekfsb64, ciphertext: ctb64 } = payload;
+      const isB = !recipient;
+      const akb = decryptWithServerKey(ekfsb64);
+      if (!akb) {
         console.error(`[SRV] Failed to decrypt AES key from ${currentUsername}. Discarding.`);
         sendToClient(ws, {
           type: ServerMessageType.SYSTEM,
@@ -982,10 +1057,8 @@ wss.on('connection', (ws: WebSocket, req: IncomingMessage) => {
         });
         return;
       }
-
-      // Decrypt Message Content using AES Key
-      const plaintextMessage = decryptAesGcm(aesKeyBuffer, iv, ciphertextB64);
-      if (plaintextMessage === null) {
+      const ptm = decryptAesGcm(akb, iv, ctb64);
+      if (ptm === null) {
         console.error(
           `[SRV] Failed to decrypt message content from ${currentUsername}. Discarding.`
         );
@@ -995,90 +1068,65 @@ wss.on('connection', (ws: WebSocket, req: IncomingMessage) => {
         });
         return;
       }
-
-      // Log Message to MongoDB
-      const logData: Omit<ChatLogDocument, 'timestamp'> = {
+      const mts: Omit<MessageHistoryDocument, 'timestamp'> = {
         sender: currentUsername,
-        messageContent: plaintextMessage,
-        ipAddress: currentUserIp,
-        type: isBroadcast ? 'broadcast' : 'private',
+        messageContent: ptm,
+        isBroadcast: isB,
         ...(recipient && { recipient: recipient }),
       };
-      logToMongo(logData); // Fire-and-forget logging
-
-      // Relay Logic
-      if (isBroadcast) {
+      await saveMessageToHistory(mts);
+      if (isB) {
         console.log(`[SRV] Relaying broadcast message from ${currentUsername}`);
-        let relayedCount = 0;
-        wss.clients.forEach((targetClient) => {
-          if (targetClient !== ws && targetClient.readyState === WebSocket.OPEN) {
-            const targetClientData = clientDataMap.get(targetClient);
-            if (targetClientData?.publicKeySpkiBase64) {
-              const encryptedKeyForTargetB64 = encryptWithRecipientKey(
-                targetClientData.publicKeySpkiBase64,
-                aesKeyBuffer
-              );
-              if (encryptedKeyForTargetB64) {
-                const messageToSend: ServerReceiveMessage = {
+        let rc = 0;
+        wss.clients.forEach((tc) => {
+          if (tc !== ws && tc.readyState === WebSocket.OPEN) {
+            const tcd = clientDataMap.get(tc);
+            if (tcd?.publicKeySpkiBase64) {
+              const ekftb64 = encryptWithRecipientKey(tcd.publicKeySpkiBase64, akb);
+              if (ekftb64) {
+                const mts: ServerReceiveMessage = {
                   type: ServerMessageType.RECEIVE_MESSAGE,
                   sender: currentUsername,
                   isBroadcast: true,
-                  payload: {
-                    iv: iv,
-                    encryptedKey: encryptedKeyForTargetB64,
-                    ciphertext: ciphertextB64,
-                  },
+                  payload: { iv: iv, encryptedKey: ekftb64, ciphertext: ctb64 },
                 };
-                sendToClient(targetClient, messageToSend);
-                relayedCount++;
+                sendToClient(tc, mts);
+                rc++;
               } else {
                 console.error(
-                  `[SRV] Failed to re-encrypt AES key for broadcast recipient ${targetClientData.username}`
+                  `[SRV] Failed to re-encrypt AES key for broadcast recipient ${tcd.username}`
                 );
               }
             } else {
               console.warn(
                 `[SRV] Cannot relay broadcast to ${
-                  targetClientData?.username || 'unknown client'
-                }: Missing public key.`
+                  tcd?.username || 'unknown client'
+                }: Missing public key or not logged in.`
               );
             }
           }
         });
-        console.log(`[SRV] Relayed broadcast message to ${relayedCount} other clients.`);
+        console.log(`[SRV] Relayed broadcast message to ${rc} other clients.`);
       } else if (recipient) {
-        // Private message
         console.log(`[SRV] Relaying private message from ${currentUsername} to ${recipient}`);
-        const recipientWs = clientsByName.get(recipient);
-        const recipientData = recipientWs ? clientDataMap.get(recipientWs) : null;
-        // Use the stored SPKI Base64 key for the recipient
-        if (
-          recipientWs &&
-          recipientWs.readyState === WebSocket.OPEN &&
-          recipientData?.publicKeySpkiBase64
-        ) {
-          const encryptedKeyForRecipientB64 = encryptWithRecipientKey(
-            recipientData.publicKeySpkiBase64,
-            aesKeyBuffer
-          );
-          if (encryptedKeyForRecipientB64) {
-            const messageToSend: ServerReceiveMessage = {
+        const rws = clientsByName.get(recipient);
+        const rd = rws ? clientDataMap.get(rws) : null;
+        if (rws && rws.readyState === WebSocket.OPEN && rd?.publicKeySpkiBase64) {
+          const ekfrb64 = encryptWithRecipientKey(rd.publicKeySpkiBase64, akb);
+          if (ekfrb64) {
+            const mts: ServerReceiveMessage = {
               type: ServerMessageType.RECEIVE_MESSAGE,
               sender: currentUsername,
               isBroadcast: false,
-              payload: {
-                iv: iv,
-                encryptedKey: encryptedKeyForRecipientB64,
-                ciphertext: ciphertextB64,
-              },
+              payload: { iv: iv, encryptedKey: ekfrb64, ciphertext: ctb64 },
             };
-            sendToClient(recipientWs, messageToSend);
+            sendToClient(rws, mts);
             console.log(`[SRV] Relayed private message to ${recipient}`);
           } else {
             console.error(`[SRV] Failed to re-encrypt AES key for recipient ${recipient}`);
             sendToClient(ws, {
               type: ServerMessageType.SYSTEM,
-              content: `[SRV Error] Could not encrypt message for ${recipient}.`,
+              content: `[SRV Error] Could not encrypt message for ${recipient}. Message not delivered.`,
             });
           }
         } else {
@@ -1091,7 +1139,43 @@ wss.on('connection', (ws: WebSocket, req: IncomingMessage) => {
           });
         }
       }
-      return; // End message handling
+      return;
+    }
+
+    // Handle Typing Indicators
+    if (isStartTypingMessage(parsedData) || isStopTypingMessage(parsedData)) {
+      const { recipient } = parsedData;
+      const isBroadcast = !recipient;
+      const messageType = isStartTypingMessage(parsedData)
+        ? ServerMessageType.USER_TYPING
+        : ServerMessageType.USER_STOPPED_TYPING;
+
+      const messageToSend: UserTypingMessage | UserStoppedTypingMessage = {
+        type: messageType,
+        sender: currentUsername,
+        // Include recipient only if it was a private typing indicator
+        ...(recipient && { recipient: recipient }),
+      };
+
+      if (isBroadcast) {
+        // Broadcast to everyone EXCEPT the sender
+        // console.log(`[SRV] Broadcasting ${messageType} from ${currentUsername}`); // Can be noisy
+        wss.clients.forEach((client) => {
+          if (client !== ws && client.readyState === WebSocket.OPEN && clientDataMap.has(client)) {
+            sendToClient(client, messageToSend);
+          }
+        });
+      } else if (recipient) {
+        // Send only to the specified recipient
+        const recipientWs = clientsByName.get(recipient);
+        if (recipientWs && recipientWs.readyState === WebSocket.OPEN) {
+          // console.log(`[SRV] Sending ${messageType} from ${currentUsername} to ${recipient}`); // Can be noisy
+          sendToClient(recipientWs, messageToSend);
+        } else {
+          // console.log(`[SRV] Typing indicator not sent: Recipient ${recipient} offline.`); // Optional log
+        }
+      }
+      return; // End typing indicator handling
     }
 
     // Handle File Transfers
@@ -1099,29 +1183,22 @@ wss.on('connection', (ws: WebSocket, req: IncomingMessage) => {
       const { recipient, fileInfo } = parsedData;
       console.log(`[SRV] Received file transfer request from ${currentUsername} to ${recipient}`);
       if (fileInfo.size > MAX_FILE_SIZE) {
-        console.warn(`[SRV] File transfer rejected: File too large.`);
+        console.warn(`[SRV] File transfer rejected: File too large (${fileInfo.size} bytes).`);
         sendToClient(ws, {
           type: ServerMessageType.SYSTEM,
           content: `File rejected: Exceeds size limit of ${MAX_FILE_SIZE / 1024 / 1024}MB.`,
         });
         return;
       }
-      const recipientWs = clientsByName.get(recipient);
-      if (recipientWs && recipientWs.readyState === WebSocket.OPEN) {
-        logToMongo({
-          type: 'file_request',
-          sender: currentUsername,
-          recipient: recipient,
-          fileInfo: { name: fileInfo.name, size: fileInfo.size },
-          ipAddress: currentUserIp,
-        });
-        const messageToSend: IncomingFileRequestMessage = {
+      const rws = clientsByName.get(recipient);
+      if (rws && rws.readyState === WebSocket.OPEN) {
+        const mts: IncomingFileRequestMessage = {
           type: ServerMessageType.INCOMING_FILE_REQUEST,
           sender: currentUsername,
           fileInfo: fileInfo,
         };
         console.log(`   -> Relaying request to ${recipient}`);
-        sendToClient(recipientWs, messageToSend);
+        sendToClient(rws, mts);
       } else {
         console.log(`[SRV] File transfer request failed: Recipient '${recipient}' offline.`);
         sendToClient(ws, {
@@ -1132,74 +1209,58 @@ wss.on('connection', (ws: WebSocket, req: IncomingMessage) => {
       return;
     }
     if (isFileTransferAccept(parsedData)) {
-      const { sender: originalSender, fileInfo } = parsedData;
+      const { sender: os, fileInfo } = parsedData;
       console.log(
-        `[SRV] Received file transfer acceptance from ${currentUsername} for ${originalSender}'s file: ${fileInfo.name}`
+        `[SRV] Received file transfer acceptance from ${currentUsername} for ${os}'s file: ${fileInfo.name}`
       );
-      logToMongo({
-        type: 'file_accept',
-        sender: currentUsername,
-        recipient: originalSender,
-        fileInfo: fileInfo,
-        ipAddress: currentUserIp,
-      });
-      const originalSenderWs = clientsByName.get(originalSender);
-      if (originalSenderWs && originalSenderWs.readyState === WebSocket.OPEN) {
-        const messageToSend: FileAcceptNoticeMessage = {
+      const osws = clientsByName.get(os);
+      if (osws && osws.readyState === WebSocket.OPEN) {
+        const mts: FileAcceptNoticeMessage = {
           type: ServerMessageType.FILE_ACCEPT_NOTICE,
           recipient: currentUsername,
           fileInfo: fileInfo,
         };
-        console.log(`   -> Notifying original sender ${originalSender}`);
-        sendToClient(originalSenderWs, messageToSend);
+        console.log(`   -> Notifying original sender ${os}`);
+        sendToClient(osws, mts);
       } else {
-        console.log(
-          `[SRV] File acceptance notice failed: Original sender '${originalSender}' offline.`
-        );
+        console.log(`[SRV] File acceptance notice failed: Original sender '${os}' offline.`);
         sendToClient(ws, {
           type: ServerMessageType.SYSTEM,
-          content: `[SRV]: User '${originalSender}' went offline. File transfer cancelled.`,
+          content: `[SRV]: User '${os}' went offline. File transfer cancelled.`,
         });
       }
       return;
     }
     if (isFileTransferReject(parsedData)) {
-      const { sender: originalSender, fileInfo } = parsedData;
+      const { sender: os, fileInfo } = parsedData;
       console.log(
-        `[SRV] Received file transfer rejection from ${currentUsername} for ${originalSender}'s file: ${fileInfo.name}`
+        `[SRV] Received file transfer rejection from ${currentUsername} for ${os}'s file: ${fileInfo.name}`
       );
-      logToMongo({
-        type: 'file_reject',
-        sender: currentUsername,
-        recipient: originalSender,
-        fileInfo: { name: fileInfo.name, size: -1 },
-        ipAddress: currentUserIp,
-      });
-      const originalSenderWs = clientsByName.get(originalSender);
-      if (originalSenderWs && originalSenderWs.readyState === WebSocket.OPEN) {
-        const messageToSend: FileRejectNoticeMessage = {
+      const osws = clientsByName.get(os);
+      if (osws && osws.readyState === WebSocket.OPEN) {
+        const mts: FileRejectNoticeMessage = {
           type: ServerMessageType.FILE_REJECT_NOTICE,
           recipient: currentUsername,
           fileInfo: fileInfo,
         };
-        console.log(`   -> Notifying original sender ${originalSender}`);
-        sendToClient(originalSenderWs, messageToSend);
+        console.log(`   -> Notifying original sender ${os}`);
+        sendToClient(osws, mts);
       } else {
-        console.log(
-          `[SRV] File rejection notice failed: Original sender '${originalSender}' offline.`
-        );
+        console.log(`[SRV] File rejection notice failed: Original sender '${os}' offline.`);
       }
       return;
     }
     if (isFileChunk(parsedData)) {
       const { recipient, fileInfo, chunkData, chunkIndex, isLastChunk } = parsedData;
       if (chunkData.length > MAX_CHUNK_SIZE * 1.4) {
-        console.warn(`[SRV] Received oversized chunk from ${currentUsername}. Discarding.`);
+        console.warn(
+          `[SRV] Received oversized chunk from ${currentUsername} for ${recipient}. Discarding.`
+        );
         return;
       }
-      const recipientWs = clientsByName.get(recipient);
-      if (recipientWs && recipientWs.readyState === WebSocket.OPEN) {
-        const messageToSend: FileChunkReceiveMessage = {
+      const rws = clientsByName.get(recipient);
+      if (rws && rws.readyState === WebSocket.OPEN) {
+        const mts: FileChunkReceiveMessage = {
           type: ServerMessageType.FILE_CHUNK_RECEIVE,
           sender: currentUsername,
           fileInfo: fileInfo,
@@ -1207,7 +1268,7 @@ wss.on('connection', (ws: WebSocket, req: IncomingMessage) => {
           chunkIndex: chunkIndex,
           isLastChunk: isLastChunk,
         };
-        sendToClient(recipientWs, messageToSend);
+        sendToClient(rws, mts);
       } else {
         console.log(`[SRV] File chunk relay failed: Recipient '${recipient}' offline.`);
         sendToClient(ws, {
@@ -1259,21 +1320,21 @@ wss.on('connection', (ws: WebSocket, req: IncomingMessage) => {
 // Graceful Shutdown
 const shutdown = async () => {
   console.log('[SRV] Shutting down server...');
-  heartbeatMap.forEach((intervalId) => clearInterval(intervalId));
+  heartbeatMap.forEach((intId) => clearInterval(intId));
   heartbeatMap.clear();
   console.log('[SRV] All heartbeats stopped.');
-  wss.clients.forEach((client) => {
-    if (client.readyState === WebSocket.OPEN) {
+  wss.clients.forEach((c) => {
+    if (c.readyState === WebSocket.OPEN) {
       try {
-        client.send(
+        c.send(
           JSON.stringify({ type: ServerMessageType.SYSTEM, content: 'Server is shutting down.' })
         );
-        client.close(1012, 'Server shutting down');
+        c.close(1012, 'Server shutting down');
       } catch (e) {
-        client.terminate();
+        c.terminate();
       }
     } else {
-      client.terminate();
+      c.terminate();
     }
   });
   console.log('[SRV] Notified clients and initiated closing connections.');
