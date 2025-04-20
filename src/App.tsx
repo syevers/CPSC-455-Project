@@ -18,7 +18,7 @@ import { ScrollArea } from '@/components/ui/scroll-area';
 import {
   AlertCircle,
   Check,
-  Circle, // For online indicator
+  Circle,
   Download,
   File as FileIcon,
   Lock,
@@ -43,7 +43,7 @@ const ALL_CHAT_KEY = 'All Chat';
 const TYPING_TIMEOUT_MS = 2000; // Stop typing after 2 seconds of inactivity
 const TYPING_THROTTLE_MS = 5000; // Send START_TYPING max once every 5 seconds
 
-// Crypto Helper Functions (Unchanged)
+// Crypto Helper Functions
 const bufferToBase64 = (buffer: ArrayBuffer): string => {
   let b = '';
   const B = new Uint8Array(buffer);
@@ -150,7 +150,7 @@ const decryptRsaOaep = async (privateKey: CryptoKey, base64Data: string): Promis
   }
 };
 
-// --- Message Types ---
+// Message Types
 enum ClientMessageType {
   LOGIN = 'login',
   LOGOUT = 'logout',
@@ -164,8 +164,8 @@ enum ClientMessageType {
   FILE_TRANSFER_REJECT = 'file_transfer_reject',
   FILE_CHUNK = 'file_chunk',
   REQUEST_HISTORY = 'request_history',
-  START_TYPING = 'start_typing', // Client indicates typing start
-  STOP_TYPING = 'stop_typing', // Client indicates typing stop
+  START_TYPING = 'start_typing',
+  STOP_TYPING = 'stop_typing',
 }
 enum ServerMessageType {
   SYSTEM = 'system',
@@ -180,11 +180,11 @@ enum ServerMessageType {
   FILE_REJECT_NOTICE = 'file_reject_notice',
   FILE_CHUNK_RECEIVE = 'file_chunk_receive',
   RECEIVE_HISTORY = 'receive_history',
-  USER_TYPING = 'user_typing', // User started typing
-  USER_STOPPED_TYPING = 'user_stopped_typing', // User stopped typing
+  USER_TYPING = 'user_typing',
+  USER_STOPPED_TYPING = 'user_stopped_typing',
 }
 
-// --- Client-Side Interfaces ---
+// Client-Side Interfaces
 interface ServerMessageBase {
   type: ServerMessageType;
 }
@@ -214,7 +214,7 @@ interface ServerReceiveMessage extends ServerMessageBase {
   isBroadcast: boolean;
   payload: { iv: string; encryptedKey: string; ciphertext: string };
 }
-// File Transfer Interfaces (Unchanged)
+// File Transfer Interfaces
 interface FileInfo {
   name: string;
   size: number;
@@ -245,7 +245,7 @@ interface FileChunkReceiveMessage extends ServerMessageBase {
   chunkIndex: number;
   isLastChunk: boolean;
 }
-// History Interfaces (Unchanged)
+// History Interfaces
 interface PersistedDisplayMessage {
   type: 'system' | 'chat' | 'my_chat' | 'error';
   content: string;
@@ -287,9 +287,9 @@ type ServerMessage =
   | FileChunkReceiveMessage
   | ReceiveHistoryMessage
   | UserTypingMessage
-  | UserStoppedTypingMessage; // Added typing messages
+  | UserStoppedTypingMessage;
 
-// --- UI State Interfaces ---
+// UI State Interfaces
 interface DisplayMessage {
   type: 'system' | 'chat' | 'my_chat' | 'error' | 'file_request' | 'file_notice' | 'file_image';
   content: string | React.ReactNode;
@@ -309,7 +309,7 @@ interface TypingUsersState {
   [peerKey: string]: Set<string>;
 }
 
-// File Transfer State Interfaces (Unchanged)
+// File Transfer State Interfaces
 interface FileTransferRequest {
   id: string;
   sender: string;
@@ -335,11 +335,11 @@ interface ReceivingFileState {
   status: 'receiving' | 'complete' | 'error' | 'decrypting';
 }
 
-// Helper to generate unique IDs (Unchanged)
+// Helper to generate unique IDs
 const generateUniqueId = () =>
   `transfer_${Date.now()}_${Math.random().toString(36).substring(2, 9)}`;
 
-// --- React Component ---
+// React Component
 function App(): React.ReactElement {
   // State & Refs
   const [isConnected, setIsConnected] = useState<boolean>(false);
@@ -381,7 +381,7 @@ function App(): React.ReactElement {
   const typingTimeoutRef = useRef<NodeJS.Timeout | null>(null); // Timeout for STOP_TYPING
   const typingSentTimestampRef = useRef<number>(0); // Throttle START_TYPING
 
-  // --- Effects ---
+  // Effects
   const currentChatKey = selectedUser ?? ALL_CHAT_KEY;
   useEffect(() => {
     messagesEndRef.current?.scrollIntoView({ behavior: 'smooth' });
@@ -425,16 +425,12 @@ function App(): React.ReactElement {
     };
   }, []);
 
-  // WebSocket Connection and Message Handling Effect (Unchanged from previous version)
+  // WebSocket Connection and Message Handling Effect
   useEffect(() => {
     let isEffectMounted = true;
     let localWsInstance: WebSocket | null = null;
     const connect = () => {
-      /* Connection logic unchanged */ if (
-        isConnecting.current ||
-        (ws.current && ws.current.readyState === WebSocket.OPEN)
-      )
-        return;
+      if (isConnecting.current || (ws.current && ws.current.readyState === WebSocket.OPEN)) return;
       if (reconnectTimeoutId.current) {
         clearTimeout(reconnectTimeoutId.current);
         reconnectTimeoutId.current = null;
@@ -475,7 +471,7 @@ function App(): React.ReactElement {
         setLoginError('');
       };
       currentRunWs.onclose = (event: CloseEvent) => {
-        /* onclose logic unchanged */ if (localWsInstance !== currentRunWs) return;
+        if (localWsInstance !== currentRunWs) return;
         console.log(
           `[WS] WebSocket Disconnected (onclose). Code: ${event.code}, Reason: ${event.reason}`
         );
@@ -505,13 +501,12 @@ function App(): React.ReactElement {
         }
       };
       currentRunWs.onerror = (event: Event) => {
-        /* onerror logic unchanged */ if (localWsInstance !== currentRunWs || !isEffectMounted)
-          return;
+        if (localWsInstance !== currentRunWs || !isEffectMounted) return;
         console.error('[WS] WebSocket Error:', event);
         isConnecting.current = false;
       };
 
-      // --- onmessage Handler (Unchanged from previous version) ---
+      // onmessage Handler
       currentRunWs.onmessage = async (event: MessageEvent) => {
         if (ws.current !== currentRunWs || !isEffectMounted) return;
         try {
@@ -917,7 +912,7 @@ function App(): React.ReactElement {
     };
   }, [addMessageToHistory]); // Keep dependency array minimal
 
-  // Effect for Sharing User's Public Key (Unchanged)
+  // Effect for Sharing User's Public Key
   useEffect(() => {
     if (isLoggedIn && isConnected && myKeyPairState?.publicKey && !hasSharedKey.current) {
       const shareKey = async () => {
@@ -938,9 +933,9 @@ function App(): React.ReactElement {
     if (!isLoggedIn || !isConnected) hasSharedKey.current = false;
   }, [isLoggedIn, isConnected, myKeyPairState, addMessageToHistory]);
 
-  // --- Event Handlers ---
+  // Event Handlers
 
-  // sendData function (Unchanged)
+  // sendData function
   const sendData = (data: { type: ClientMessageType; [key: string]: unknown }) => {
     const s = ws.current;
     const lt = data.type;
@@ -958,7 +953,7 @@ function App(): React.ReactElement {
     }
   };
 
-  // handleLogin (Unchanged)
+  // handleLogin
   const handleLogin = (e: React.FormEvent<HTMLFormElement>) => {
     e.preventDefault();
     if (!isConnected) {
@@ -979,7 +974,7 @@ function App(): React.ReactElement {
     sendData({ type: ClientMessageType.LOGIN, username: username, password: password });
   };
 
-  // sendTextMessageContent (Unchanged)
+  // sendTextMessageContent
   const sendTextMessageContent = async (content: string) => {
     if (!isLoggedIn || !isConnected || !content.trim()) return;
     if (!keyPairRef.current?.privateKey) {
@@ -1021,7 +1016,7 @@ function App(): React.ReactElement {
     }
   };
 
-  // handleSendMessage (Unchanged)
+  // handleSendMessage
   const handleSendMessage = async (e?: React.FormEvent<HTMLFormElement>) => {
     e?.preventDefault();
     const ti = inputValue.trim();
@@ -1029,7 +1024,7 @@ function App(): React.ReactElement {
     else if (selectedFile) handleSendFile();
   };
 
-  // handleLogout (MODIFIED - Reset typing state)
+  // handleLogout
   const handleLogout = () => {
     if (!isLoggedIn) return;
     console.log('[App] Initiating logout...');
@@ -1072,21 +1067,20 @@ function App(): React.ReactElement {
     }
   };
 
-  // handleUsernameChange, handlePasswordChange (Unchanged)
   const handleUsernameChange = (e: React.ChangeEvent<HTMLInputElement>) => {
     setUsername(e.target.value);
   };
   const handlePasswordChange = (e: React.ChangeEvent<HTMLInputElement>) =>
     setPassword(e.target.value);
 
-  // --- Typing Indicator Logic ---
+  // Typing Indicator Logic
   const sendStopTyping = useCallback(() => {
     sendData({ type: ClientMessageType.STOP_TYPING, recipient: selectedUser || undefined });
     typingSentTimestampRef.current = 0; // Allow sending START_TYPING again
     typingTimeoutRef.current = null;
   }, [selectedUser]); // Recreate if selectedUser changes
 
-  // Handles text input change - MODIFIED for typing indicator
+  // Handles text input change
   const handleInputChange = (e: React.ChangeEvent<HTMLTextAreaElement>) => {
     setInputValue(e.target.value);
 
@@ -1104,7 +1098,7 @@ function App(): React.ReactElement {
     typingTimeoutRef.current = setTimeout(sendStopTyping, TYPING_TIMEOUT_MS);
   };
 
-  // Handle input blur - MODIFIED for typing indicator
+  // Handle input blur
   const handleInputBlur = () => {
     if (typingTimeoutRef.current) {
       clearTimeout(typingTimeoutRef.current);
@@ -1115,7 +1109,7 @@ function App(): React.ReactElement {
     }
   };
 
-  // handleKeyDown - MODIFIED for typing indicator
+  // handleKeyDown
   const handleKeyDown = (event: React.KeyboardEvent<HTMLTextAreaElement>) => {
     if (event.key === 'Enter') {
       if (!event.shiftKey) {
@@ -1129,15 +1123,11 @@ function App(): React.ReactElement {
     }
   };
 
-  // Other handlers (handleUserSelect, handleSelectMainChat, handleFileChange, handleSendFile,
-  // sendChunk, handleAcceptFile, handleRejectFile, handleDownloadFile, handleEmojiSelect)
-  // remain unchanged in their core logic.
   const handleUserSelect = (user: string) => {
     const clu = usernameRef.current;
     if (user !== clu) {
       setSelectedUser(user);
       if (isLoggedIn && !peerPublicKeys.has(user)) {
-        // addMessageToHistory(user, { type: 'system', content: `Requesting key for ${user}...` });
         sendData({ type: ClientMessageType.REQUEST_PUBLIC_KEY, username: user });
       }
     }
@@ -1389,12 +1379,12 @@ function App(): React.ReactElement {
     setShowEmojiPicker(false);
   };
 
-  // --- Derived State for UI rendering ---
+  // Derived State for UI rendering
   const currentMessages = chatHistories[currentChatKey] || [];
   // Combine online users and users with history for the sidebar list
   const displayablePeers = Array.from(
     new Set([
-      ...users.filter((u) => u !== currentUsername), // Start with online users (excluding self)
+      ...users.filter((u) => u !== currentUsername),
       ...Object.keys(chatHistories).filter(
         (key) => key !== ALL_CHAT_KEY && key !== currentUsername
       ), // Add users from history (excluding self and All Chat)
@@ -1404,7 +1394,7 @@ function App(): React.ReactElement {
   // Get users currently typing in the active chat context
   const usersTypingInCurrentChat = Array.from(typingUsers[currentChatKey] || []);
 
-  // --- Render UI ---
+  // Render UI
   return (
     <div className="flex flex-col h-screen bg-gradient-to-br from-blue-100 via-purple-100 to-pink-100 p-4 gap-4 font-sans">
       {/* Header (Unchanged) */}
@@ -1555,7 +1545,6 @@ function App(): React.ReactElement {
             </div>
           </CardHeader>
 
-          {/* Message Display (Unchanged rendering logic) */}
           <CardContent className="flex-1 p-0 overflow-hidden">
             <ScrollArea className="h-full w-full p-4">
               {isHistoryLoading && isLoggedIn && (
@@ -1757,7 +1746,7 @@ function App(): React.ReactElement {
             </ScrollArea>
           </CardContent>
 
-          {/* Input Area (FIXED - PopoverTrigger) */}
+          {/* Input Area  */}
           <CardFooter className="p-4 border-t bg-gray-50/80">
             {!isLoggedIn ? (
               /* Login Form */ <form onSubmit={handleLogin} className="w-full space-y-3">
@@ -1899,11 +1888,9 @@ function App(): React.ReactElement {
                         disabled={!isConnected || !serverPublicKey}
                         autoComplete="off"
                       />
-                      {/* Emoji Picker - FIXED */}
+                      {/* Emoji Picker  */}
                       <Popover open={showEmojiPicker} onOpenChange={setShowEmojiPicker}>
                         <PopoverTrigger
-                          // Removed asChild prop
-                          // Apply styles directly to the trigger's button element
                           className="absolute right-1 top-1/2 -translate-y-1/2 h-7 w-7 p-0 inline-flex items-center justify-center rounded-md text-sm font-medium transition-colors focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-ring disabled:pointer-events-none disabled:opacity-50 text-gray-500 hover:bg-accent hover:text-accent-foreground" // Styles copied from Button variant=ghost, size=icon
                           title="Select emoji"
                         >

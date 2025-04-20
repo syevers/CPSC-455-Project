@@ -1,9 +1,9 @@
 import bcrypt from 'bcrypt';
-import crypto, { KeyObject } from 'crypto'; // Import crypto module
+import crypto, { KeyObject } from 'crypto';
 import { existsSync, readFileSync, writeFileSync } from 'fs';
 import type { IncomingMessage } from 'http';
 import https from 'https';
-import { Collection, Db, MongoClient, Sort } from 'mongodb'; // Import MongoDB types
+import { Collection, Db, MongoClient, Sort } from 'mongodb';
 import path from 'path';
 import { fileURLToPath } from 'url';
 import { WebSocket, WebSocketServer, type RawData } from 'ws';
@@ -63,7 +63,7 @@ interface MessageHistoryDocument {
   messageContent: string;
 }
 
-// --- Message Types ---
+// Message Types
 enum ServerMessageType {
   SYSTEM = 'system',
   USER_LIST = 'userList',
@@ -77,8 +77,8 @@ enum ServerMessageType {
   FILE_REJECT_NOTICE = 'file_reject_notice',
   FILE_CHUNK_RECEIVE = 'file_chunk_receive',
   RECEIVE_HISTORY = 'receive_history',
-  USER_TYPING = 'user_typing', // User started typing
-  USER_STOPPED_TYPING = 'user_stopped_typing', // User stopped typing
+  USER_TYPING = 'user_typing',
+  USER_STOPPED_TYPING = 'user_stopped_typing',
 }
 
 enum ClientMessageType {
@@ -94,15 +94,15 @@ enum ClientMessageType {
   FILE_TRANSFER_REJECT = 'file_transfer_reject',
   FILE_CHUNK = 'file_chunk',
   REQUEST_HISTORY = 'request_history',
-  START_TYPING = 'start_typing', // Client indicates typing start
-  STOP_TYPING = 'stop_typing', // Client indicates typing stop
+  START_TYPING = 'start_typing',
+  STOP_TYPING = 'stop_typing',
 }
 
-// --- Message Interfaces ---
+// Message Interfaces
 interface BaseMessage {
   type: ClientMessageType | ServerMessageType;
 }
-// Client -> Server
+
 interface LoginMessage extends BaseMessage {
   type: ClientMessageType.LOGIN;
   username: string;
@@ -134,11 +134,11 @@ interface ClientSendMessage extends BaseMessage {
 interface StartTypingMessage extends BaseMessage {
   type: ClientMessageType.START_TYPING;
   recipient?: string;
-} // recipient is null/undefined for broadcast
+}
 interface StopTypingMessage extends BaseMessage {
   type: ClientMessageType.STOP_TYPING;
   recipient?: string;
-} // recipient is null/undefined for broadcast
+}
 
 // Server -> Client
 interface SystemMessage extends BaseMessage {
@@ -175,14 +175,14 @@ interface UserTypingMessage extends BaseMessage {
   type: ServerMessageType.USER_TYPING;
   sender: string;
   recipient?: string;
-} // recipient is null/undefined if typing in broadcast
+}
 interface UserStoppedTypingMessage extends BaseMessage {
   type: ServerMessageType.USER_STOPPED_TYPING;
   sender: string;
   recipient?: string;
-} // recipient is null/undefined if typing in broadcast
+}
 
-// File Transfer Interfaces (Unchanged)
+// File Transfer Interfaces
 interface FileInfo {
   name: string;
   size: number;
@@ -237,7 +237,7 @@ interface FileChunkReceiveMessage extends BaseMessage {
   isLastChunk: boolean;
 }
 
-// History Structure Interface (Unchanged)
+// History Structure Interface
 interface PersistedDisplayMessage {
   type: 'system' | 'chat' | 'my_chat' | 'error';
   content: string;
@@ -250,7 +250,7 @@ interface PersistedChatHistories {
   [peerUsernameOrAllChat: string]: PersistedDisplayMessage[];
 }
 
-// --- Type Guards ---
+// Type Guards
 function isLoginMessage(msg: any): msg is LoginMessage {
   return msg?.type === ClientMessageType.LOGIN && typeof msg.username === 'string';
 }
@@ -328,7 +328,7 @@ function isStopTypingMessage(msg: any): msg is StopTypingMessage {
   );
 }
 
-// --- Crypto Helper Functions (Unchanged) ---
+// Crypto Helper Functions
 function decryptWithServerKey(encryptedDataB64: string): Buffer | null {
   if (!serverPrivateKey) {
     console.error('[CRYPTO] Server private key not loaded.');
@@ -391,7 +391,7 @@ function decryptAesGcm(aesKey: Buffer, ivB64: string, ciphertextB64: string): st
   }
 }
 
-// --- Helper Functions (Account management unchanged) ---
+// Helper Functions
 function initializeAccountsFile(): AccountsData | null {
   if (!existsSync(ACCOUNTS_PATH)) {
     console.log('[SRV] Creating accounts.json:', ACCOUNTS_PATH);
@@ -524,7 +524,7 @@ function checkRateLimit(ws: WebSocket): boolean {
   return true;
 }
 
-// --- Database Interaction Functions (Unchanged) ---
+// Database Interaction Functions
 async function saveMessageToHistory(
   messageData: Omit<MessageHistoryDocument, 'timestamp'>
 ): Promise<void> {
@@ -595,7 +595,7 @@ async function fetchUserHistory(username: string): Promise<PersistedChatHistorie
   }
 }
 
-// --- Broadcast/Send Functions (Unchanged) ---
+// Broadcast/Send Functions
 function broadcastUserList() {
   const userList = Array.from(clientsByName.keys());
   console.log('[SRV] Broadcasting user list:', userList);
@@ -631,7 +631,7 @@ function sendToClient(ws: WebSocket, message: object) {
   }
 }
 
-// --- Connection Management (Unchanged) ---
+// Connection Management
 function handleDisconnect(ws: WebSocket) {
   const cd = clientDataMap.get(ws);
   const un = cd?.username;
@@ -703,7 +703,7 @@ function stopHeartbeat(ws: WebSocket) {
   }
 }
 
-// --- MongoDB Connection Function (Unchanged) ---
+// MongoDB Connection Function
 async function connectToMongo() {
   try {
     const client = new MongoClient(MONGODB_URI);
@@ -729,7 +729,7 @@ async function connectToMongo() {
   }
 }
 
-// --- State Management (Unchanged) ---
+// State Management
 interface ClientData {
   username: string;
   ipAddress: string;
@@ -745,7 +745,7 @@ const rateLimitBlockedUsers = new Map<WebSocket, number>();
 const loginFailureCounts = new Map<string, { count: number; lastAttempt: number }>();
 const loginBlockedUsers = new Map<string, number>();
 
-// --- Main Server Startup Logic (Unchanged) ---
+//Main Server Startup Logic
 async function startServer() {
   console.log(`[SRV] Initializing...`);
   try {
@@ -773,7 +773,7 @@ async function startServer() {
   });
 }
 
-// --- Connection Handling ---
+// Connection Handling
 wss.on('connection', (ws: WebSocket, req: IncomingMessage) => {
   const ipAddress = req.socket.remoteAddress || 'unknown';
   const wsId = ws.toString();
@@ -785,7 +785,7 @@ wss.on('connection', (ws: WebSocket, req: IncomingMessage) => {
     handleDisconnect(ws);
   });
 
-  // --- WebSocket Message Handler (MODIFIED) ---
+  // WebSocket Message Handler
   ws.on('message', async (data: RawData) => {
     const clientInfo = clientDataMap.get(ws);
     const clientIdForLog = clientInfo?.username || `WS ${wsId} (IP: ${ipAddress})`;
@@ -823,7 +823,7 @@ wss.on('connection', (ws: WebSocket, req: IncomingMessage) => {
       return;
     }
 
-    // Handle Login Attempt (Unchanged logic)
+    // Handle Login Attempt
     if (isLoginMessage(parsedData)) {
       if (clientInfo) {
         sendToClient(ws, {
@@ -948,7 +948,7 @@ wss.on('connection', (ws: WebSocket, req: IncomingMessage) => {
       return; // End of login logic
     }
 
-    // --- Actions Requiring Login ---
+    // Actions Requiring Login
     if (!clientInfo) {
       console.log(`[SRV] Action rejected: Client ${clientIdForLog} is not logged in.`);
       sendToClient(ws, {
@@ -960,7 +960,7 @@ wss.on('connection', (ws: WebSocket, req: IncomingMessage) => {
     const currentUsername = clientInfo.username;
     // const currentUserIp = clientInfo.ipAddress; // Available if needed
 
-    // Handle Logout (Unchanged)
+    // Handle Logout
     if (isLogoutMessage(parsedData)) {
       console.log(`[SRV] Received logout request from ${currentUsername}. WS ID: ${wsId}`);
       handleDisconnect(ws);
@@ -972,7 +972,7 @@ wss.on('connection', (ws: WebSocket, req: IncomingMessage) => {
       return;
     }
 
-    // Handle Share Public Key (Unchanged)
+    // Handle Share Public Key
     if (isSharePublicKeyMessage(parsedData)) {
       const pk = parsedData.publicKey;
       console.log(`[SRV] Received public key (SPKI Base64) from ${currentUsername}`);
@@ -1001,7 +1001,7 @@ wss.on('connection', (ws: WebSocket, req: IncomingMessage) => {
       return;
     }
 
-    // Handle Request Public Key (Unchanged)
+    // Handle Request Public Key
     if (isRequestPublicKeyMessage(parsedData)) {
       const tu = parsedData.username;
       console.log(`[SRV] ${currentUsername} requested public key for ${tu}`);
@@ -1025,7 +1025,7 @@ wss.on('connection', (ws: WebSocket, req: IncomingMessage) => {
       return;
     }
 
-    // Handle Request History (Unchanged)
+    // Handle Request History
     if (isRequestHistoryMessage(parsedData)) {
       console.log(`[SRV] Received history request from ${currentUsername}`);
       try {
@@ -1043,7 +1043,7 @@ wss.on('connection', (ws: WebSocket, req: IncomingMessage) => {
       return;
     }
 
-    // Handle Intermediary Encrypted Messages (Unchanged logic, includes saving)
+    // Handle Intermediary Encrypted Messages
     if (isClientSendMessage(parsedData)) {
       const { recipient, payload } = parsedData;
       const { iv, encryptedKey: ekfsb64, ciphertext: ctb64 } = payload;
@@ -1142,7 +1142,7 @@ wss.on('connection', (ws: WebSocket, req: IncomingMessage) => {
       return;
     }
 
-    // --- Handle Typing Indicators ---
+    // Handle Typing Indicators
     if (isStartTypingMessage(parsedData) || isStopTypingMessage(parsedData)) {
       const { recipient } = parsedData;
       const isBroadcast = !recipient;
@@ -1178,7 +1178,7 @@ wss.on('connection', (ws: WebSocket, req: IncomingMessage) => {
       return; // End typing indicator handling
     }
 
-    // Handle File Transfers (Unchanged logic)
+    // Handle File Transfers
     if (isFileTransferRequest(parsedData)) {
       const { recipient, fileInfo } = parsedData;
       console.log(`[SRV] Received file transfer request from ${currentUsername} to ${recipient}`);
@@ -1317,7 +1317,7 @@ wss.on('connection', (ws: WebSocket, req: IncomingMessage) => {
   }
 }); // End wss.on('connection')
 
-// --- Graceful Shutdown (Unchanged) ---
+// Graceful Shutdown
 const shutdown = async () => {
   console.log('[SRV] Shutting down server...');
   heartbeatMap.forEach((intId) => clearInterval(intId));
