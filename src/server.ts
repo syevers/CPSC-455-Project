@@ -1,12 +1,17 @@
 import bcrypt from 'bcrypt';
 import crypto, { KeyObject } from 'crypto';
+import dotenv from 'dotenv'; // Import dotenv
+import admin from 'firebase-admin';
+import type { FieldValue, Timestamp } from 'firebase-admin/firestore';
 import { existsSync, readFileSync, writeFileSync } from 'fs';
 import type { IncomingMessage } from 'http';
 import https from 'https';
-import { Collection, Db, MongoClient, Sort } from 'mongodb';
 import path from 'path';
 import { fileURLToPath } from 'url';
 import { WebSocket, WebSocketServer, type RawData } from 'ws';
+
+// Load environment variables from .env
+dotenv.config();
 
 // Constants and Setup
 const __filename = fileURLToPath(import.meta.url);
@@ -17,31 +22,81 @@ const options = {
   cert: readFileSync(path.join(__dirname, '../certs/public.pem')),
 };
 const ACCOUNTS_PATH = path.join(__dirname, 'accounts.json');
-const RATE_LIMIT = 20; // Messages per second
-const RATE_LIMIT_BLOCK_DURATION = 10000; // 10 seconds
-const HEARTBEAT_INTERVAL = 30000; // 30 seconds
+const RATE_LIMIT = 20;
+const RATE_LIMIT_BLOCK_DURATION = 10000;
+const HEARTBEAT_INTERVAL = 30000;
 const SALT_ROUNDS = 10;
 const MAX_FILE_SIZE = 10 * 1024 * 1024;
 const MAX_CHUNK_SIZE = 64 * 1024;
-const MAX_HISTORY_MESSAGES = 200;
+const MAX_HISTORY_MESSAGES = 200; // Max total messages to return
 const ALL_CHAT_KEY = 'All Chat';
+const FIRESTORE_HISTORY_COLLECTION = 'chatlogs'; // Firestore collection name
+
+// Firebase Admin Initialization
+let firestore: admin.firestore.Firestore | null = null; // Firestore instance
+let serviceAccount: any; // Define serviceAccount outside try block for logging in catch
+
+try {
+  // Validate that environment variables are loaded
+  if (!process.env.FIREBASE_DATABASE_URL) {
+  }
+  if (!process.env.FIREBASE_SERVICE_ACCOUNT_KEY_PATH) {
+    throw new Error(
+      'FIREBASE_SERVICE_ACCOUNT_KEY_PATH is not defined in the environment variables.'
+    );
+  }
+
+  // Construct the absolute path to the service account key
+  const serviceAccountPath = path.resolve(process.env.FIREBASE_SERVICE_ACCOUNT_KEY_PATH);
+
+  if (!existsSync(serviceAccountPath)) {
+    throw new Error(
+      `Firebase service account key file not found at path: ${serviceAccountPath}. Check FIREBASE_SERVICE_ACCOUNT_KEY_PATH in your .env file.`
+    );
+  }
+
+  // Load JSON using fs.readFileSync and JSON.parse
+  const serviceAccountJson = readFileSync(serviceAccountPath, 'utf8');
+  serviceAccount = JSON.parse(serviceAccountJson);
+
+  // Ensure serviceAccount is a valid object before proceeding
+  if (!serviceAccount || typeof serviceAccount !== 'object') {
+    throw new Error('Parsed service account is not a valid object.');
+  }
+
+  // Initialize
+  admin.initializeApp({
+    credential: admin.credential.cert(serviceAccount),
+  });
+
+  // Get Firestore instance
+  firestore = admin.firestore();
+  // check Firestore instance
+  if (firestore) {
+    console.log('[SRV-DB] Firestore instance obtained successfully.');
+  } else {
+    // This case should ideally not happen if initializeApp succeeded without error
+    throw new Error('Failed to get Firestore instance from initialized app.');
+  }
+
+  console.log('[SRV-DB] Firebase Admin SDK initialized successfully for Firestore.');
+} catch (error: any) {
+  console.error('[SRV-DB] FATAL: Failed to initialize Firebase Admin SDK:', error.message);
+  if (typeof serviceAccount !== 'undefined') {
+    console.error('[SRV-DB] Service Account Object causing error:', serviceAccount);
+  }
+  // Exit if Firebase cannot be initialized
+  process.exit(1);
+}
 
 // WebSocket Server Initialization
 const server = https.createServer(options);
 const wss = new WebSocketServer({ server });
 
-// Brute-Force Protection Constants
+// Brute-Force Protection Constants (Unchanged)
 const MAX_LOGIN_ATTEMPTS = 5;
-const LOGIN_BLOCK_DURATION = 60 * 1000; // 1 minute
-const ATTEMPT_WINDOW = 5 * 60 * 1000; // 5 minutes
-
-// MongoDB Setup
-const MONGODB_URI = process.env.MONGODB_URI || 'mongodb://localhost:27017';
-const MONGODB_DB_NAME = 'secureChat';
-const MONGODB_HISTORY_COLLECTION = 'messageHistory';
-
-let db: Db | null = null;
-let messageHistoryCollection: Collection<MessageHistoryDocument> | null = null;
+const LOGIN_BLOCK_DURATION = 60 * 1000;
+const ATTEMPT_WINDOW = 5 * 60 * 1000;
 
 // Server Keys
 let serverPrivateKey: KeyObject | null = null;
@@ -55,12 +110,18 @@ interface UserAccount {
 interface AccountsData {
   users: UserAccount[];
 }
+
+// Interface for Firestore document
 interface MessageHistoryDocument {
-  timestamp: Date;
+  timestamp: FieldValue;
   sender: string;
   recipient?: string;
   isBroadcast: boolean;
   messageContent: string;
+}
+// Interface for data read from Firestore
+interface MessageHistoryData extends Omit<MessageHistoryDocument, 'timestamp'> {
+  timestamp: Timestamp;
 }
 
 // Message Types
@@ -80,7 +141,6 @@ enum ServerMessageType {
   USER_TYPING = 'user_typing',
   USER_STOPPED_TYPING = 'user_stopped_typing',
 }
-
 enum ClientMessageType {
   LOGIN = 'login',
   LOGOUT = 'logout',
@@ -102,7 +162,6 @@ enum ClientMessageType {
 interface BaseMessage {
   type: ClientMessageType | ServerMessageType;
 }
-
 interface LoginMessage extends BaseMessage {
   type: ClientMessageType.LOGIN;
   username: string;
@@ -139,8 +198,6 @@ interface StopTypingMessage extends BaseMessage {
   type: ClientMessageType.STOP_TYPING;
   recipient?: string;
 }
-
-// Server -> Client
 interface SystemMessage extends BaseMessage {
   type: ServerMessageType.SYSTEM;
   content: string;
@@ -167,6 +224,17 @@ interface ReceivePublicKeyServerMessage extends BaseMessage {
 interface PingMessage extends BaseMessage {
   type: ServerMessageType.PING;
 }
+interface PersistedDisplayMessage {
+  type: 'system' | 'chat' | 'my_chat' | 'error';
+  content: string;
+  sender?: string;
+  recipient?: string;
+  timestamp?: number;
+  isEncrypted?: boolean;
+}
+interface PersistedChatHistories {
+  [peerUsernameOrAllChat: string]: PersistedDisplayMessage[];
+}
 interface ReceiveHistoryMessage extends BaseMessage {
   type: ServerMessageType.RECEIVE_HISTORY;
   history: PersistedChatHistories;
@@ -181,8 +249,6 @@ interface UserStoppedTypingMessage extends BaseMessage {
   sender: string;
   recipient?: string;
 }
-
-// File Transfer Interfaces
 interface FileInfo {
   name: string;
   size: number;
@@ -235,19 +301,6 @@ interface FileChunkReceiveMessage extends BaseMessage {
   chunkData: string;
   chunkIndex: number;
   isLastChunk: boolean;
-}
-
-// History Structure Interface
-interface PersistedDisplayMessage {
-  type: 'system' | 'chat' | 'my_chat' | 'error';
-  content: string;
-  sender?: string;
-  recipient?: string;
-  timestamp?: number;
-  isEncrypted?: boolean;
-}
-interface PersistedChatHistories {
-  [peerUsernameOrAllChat: string]: PersistedDisplayMessage[];
 }
 
 // Type Guards
@@ -314,7 +367,6 @@ function isFileChunk(msg: any): msg is FileChunkMessage {
 function isRequestHistoryMessage(msg: any): msg is RequestHistoryMessage {
   return msg?.type === ClientMessageType.REQUEST_HISTORY;
 }
-// Typing indicator guards
 function isStartTypingMessage(msg: any): msg is StartTypingMessage {
   return (
     msg?.type === ClientMessageType.START_TYPING &&
@@ -525,74 +577,137 @@ function checkRateLimit(ws: WebSocket): boolean {
 }
 
 // Database Interaction Functions
+
+/**
+ * Saves a message to Firestore.
+ * @param messageData - The message data to save.
+ */
 async function saveMessageToHistory(
   messageData: Omit<MessageHistoryDocument, 'timestamp'>
 ): Promise<void> {
-  if (!messageHistoryCollection) {
-    console.error('[SRV-DB] History collection not available. Cannot save message.');
+  if (!firestore) {
+    console.error('[SRV-DB] Firestore not initialized. Cannot save message.');
     return;
   }
-  const doc: MessageHistoryDocument = { ...messageData, timestamp: new Date() };
   try {
-    const r = await messageHistoryCollection.insertOne(doc);
-    if (!r.acknowledged) {
-      console.warn('[SRV-DB] DB insert not acknowledged for sender:', messageData.sender);
-    }
-  } catch (e) {
-    console.error('[SRV-DB] Error saving message to DB:', e, 'Data:', doc);
+    const historyCollection = firestore.collection(FIRESTORE_HISTORY_COLLECTION);
+    // Use add() to let Firestore generate a document ID
+    await historyCollection.add({
+      ...messageData,
+      // Use Firestore server timestamp
+      timestamp: admin.firestore.FieldValue.serverTimestamp(),
+    });
+  } catch (error) {
+    console.error('[SRV-DB] Error saving message to Firestore:', error, 'Data:', messageData);
   }
 }
+
+/**
+ * Fetches chat history for a given user from Firestore.
+ * Uses multiple queries for potentially better efficiency than fetching all and filtering.
+ * @param username - The username whose history is being fetched.
+ * @returns A Promise resolving to the chat history formatted for the client.
+ */
 async function fetchUserHistory(username: string): Promise<PersistedChatHistories> {
   const history: PersistedChatHistories = { [ALL_CHAT_KEY]: [] };
-  if (!messageHistoryCollection) {
-    console.error(
-      `[SRV-DB] History collection not available. Cannot fetch history for ${username}.`
-    );
+  if (!firestore) {
+    console.error(`[SRV-DB] Firestore not initialized. Cannot fetch history for ${username}.`);
     return history;
   }
+  const historyCollection = firestore.collection(FIRESTORE_HISTORY_COLLECTION);
+
   try {
-    const query = { $or: [{ sender: username }, { recipient: username }, { isBroadcast: true }] };
-    const sort: Sort = { timestamp: -1 };
-    const dbMessages = await messageHistoryCollection
-      .find(query)
-      .sort(sort)
-      .limit(MAX_HISTORY_MESSAGES)
-      .toArray();
-    dbMessages.reverse().forEach((msg) => {
-      let messageType: PersistedDisplayMessage['type'] = 'chat';
-      if (msg.sender === username) {
-        messageType = 'my_chat';
+    // Fetch messages sent BY the user
+    const sentQuery = historyCollection
+      .where('sender', '==', username)
+      .orderBy('timestamp', 'desc')
+      .limit(MAX_HISTORY_MESSAGES);
+
+    // Fetch messages sent TO the user
+    const receivedQuery = historyCollection
+      .where('recipient', '==', username)
+      .orderBy('timestamp', 'desc')
+      .limit(MAX_HISTORY_MESSAGES);
+
+    // Fetch broadcast messages
+    const broadcastQuery = historyCollection
+      .where('isBroadcast', '==', true)
+      .orderBy('timestamp', 'desc')
+      .limit(MAX_HISTORY_MESSAGES);
+
+    // Execute queries in parallel
+    const [sentSnapshot, receivedSnapshot, broadcastSnapshot] = await Promise.all([
+      sentQuery.get(),
+      receivedQuery.get(),
+      broadcastQuery.get(),
+    ]);
+
+    // Combine results and deduplicate
+    const combinedMessages = new Map<string, MessageHistoryData>();
+
+    sentSnapshot.forEach((doc) => combinedMessages.set(doc.id, doc.data() as MessageHistoryData));
+    receivedSnapshot.forEach((doc) =>
+      combinedMessages.set(doc.id, doc.data() as MessageHistoryData)
+    );
+    broadcastSnapshot.forEach((doc) =>
+      combinedMessages.set(doc.id, doc.data() as MessageHistoryData)
+    );
+
+    // Convert map values to array, filter out any potentially null/invalid timestamps
+    const validMessages = Array.from(combinedMessages.values()).filter((msg) => msg.timestamp);
+
+    // Sort combined results DESCENDING by timestamp
+    validMessages.sort((a, b) => b.timestamp.toMillis() - a.timestamp.toMillis());
+    // Take the latest N messages overall
+    const limitedMessages = validMessages.slice(0, MAX_HISTORY_MESSAGES);
+    // Reverse to get chronological order for client
+    limitedMessages.reverse();
+
+    // Reconstruct the history object for the client
+    limitedMessages.forEach((msg) => {
+      // Ensure timestamp is valid before processing
+      if (!msg.timestamp || typeof msg.timestamp.toMillis !== 'function') {
+        console.warn('[SRV-DB] Skipping message with invalid timestamp:', msg);
+        return;
       }
+
+      let messageType: PersistedDisplayMessage['type'] = 'chat';
+      if (msg.sender === username) messageType = 'my_chat';
+
       const displayMsg: PersistedDisplayMessage = {
         type: messageType,
         content: msg.messageContent,
         sender: msg.sender,
         recipient: msg.sender === username ? msg.recipient : undefined,
-        timestamp: msg.timestamp.getTime(),
+        timestamp: msg.timestamp.toMillis(), // Convert Firestore Timestamp to milliseconds
         isEncrypted: true,
       };
+
       let peerKey: string;
-      if (msg.isBroadcast) {
-        peerKey = ALL_CHAT_KEY;
-      } else if (msg.sender === username) {
-        peerKey = msg.recipient!;
-      } else {
-        peerKey = msg.sender;
-      }
-      if (!history[peerKey]) {
-        history[peerKey] = [];
-      }
+      if (msg.isBroadcast) peerKey = ALL_CHAT_KEY;
+      else if (msg.sender === username) peerKey = msg.recipient!;
+      else peerKey = msg.sender;
+
+      if (!history[peerKey]) history[peerKey] = [];
       history[peerKey].push(displayMsg);
     });
-    if (!history[ALL_CHAT_KEY]) {
-      history[ALL_CHAT_KEY] = [];
+
+    if (!history[ALL_CHAT_KEY]) history[ALL_CHAT_KEY] = []; // Ensure All Chat exists
+    console.log(
+      `[SRV-DB] Processed ${limitedMessages.length} history messages for ${username} from Firestore.`
+    );
+  } catch (error) {
+    console.error(`[SRV-DB] Error fetching history for ${username} from Firestore:`, error);
+    if ((error as any).code === 5 || (error as any).code === 'failed-precondition') {
+      // Check for NOT_FOUND or FAILED_PRECONDITION
+      console.error(
+        "[SRV-DB] Hint: Firestore query failed. This might be due to missing indexes or the collection '" +
+          FIRESTORE_HISTORY_COLLECTION +
+          "' not existing. Check the Firestore console in your Firebase project to create the necessary composite indexes based on the 'where' and 'orderBy' clauses used in fetchUserHistory (sender+timestamp, recipient+timestamp, isBroadcast+timestamp). Also ensure the collection exists or the first write succeeds."
+      );
     }
-    console.log(`[SRV-DB] Fetched ${dbMessages.length} history messages for ${username}.`);
-    return history;
-  } catch (e) {
-    console.error(`[SRV-DB] Error fetching history for ${username}:`, e);
-    return history;
   }
+  return history;
 }
 
 // Broadcast/Send Functions
@@ -703,32 +818,6 @@ function stopHeartbeat(ws: WebSocket) {
   }
 }
 
-// MongoDB Connection Function
-async function connectToMongo() {
-  try {
-    const client = new MongoClient(MONGODB_URI);
-    await client.connect();
-    db = client.db(MONGODB_DB_NAME);
-    messageHistoryCollection = db.collection(MONGODB_HISTORY_COLLECTION);
-    await messageHistoryCollection.createIndex({ timestamp: -1 });
-    await messageHistoryCollection.createIndex({ sender: 1 });
-    await messageHistoryCollection.createIndex({ recipient: 1 });
-    await messageHistoryCollection.createIndex({ isBroadcast: 1 });
-    await messageHistoryCollection.createIndex({
-      sender: 1,
-      recipient: 1,
-      isBroadcast: 1,
-      timestamp: -1,
-    });
-    console.log(
-      `[SRV-DB] Successfully connected to MongoDB: ${MONGODB_DB_NAME}/${MONGODB_HISTORY_COLLECTION}`
-    );
-  } catch (e) {
-    console.error('[SRV-DB] Failed to connect to MongoDB:', e);
-    process.exit(1);
-  }
-}
-
 // State Management
 interface ClientData {
   username: string;
@@ -745,29 +834,30 @@ const rateLimitBlockedUsers = new Map<WebSocket, number>();
 const loginFailureCounts = new Map<string, { count: number; lastAttempt: number }>();
 const loginBlockedUsers = new Map<string, number>();
 
-//Main Server Startup Logic
+// Main Server Startup Logic
 async function startServer() {
   console.log(`[SRV] Initializing...`);
+  // Load server keys
   try {
     const privPath = path.join(__dirname, '../certs/server_private.pem');
     const pubPath = path.join(__dirname, '../certs/server_public.pem');
     if (!existsSync(privPath) || !existsSync(pubPath)) {
-      console.error(`[FATAL] Server key pair not found in certs/ directory.`);
-      process.exit(1);
+      throw new Error(`Server key pair not found in certs/ directory.`);
     }
     const privPem = readFileSync(privPath, 'utf8');
     serverPublicKeyPem = readFileSync(pubPath, 'utf8');
     serverPrivateKey = crypto.createPrivateKey(privPem);
     console.log('[SRV] Server key pair loaded successfully.');
-  } catch (e) {
-    console.error('[SRV] Failed to load server key pair:', e);
+  } catch (error: any) {
+    console.error('[SRV] Failed to load server key pair:', error.message);
     process.exit(1);
   }
-  console.log(`[SRV] Connecting to MongoDB...`);
-  await connectToMongo();
+
+  // Load accounts
   loadAccounts();
   console.log(`[SRV] User accounts loaded.`);
   console.log(`[SRV] Initialization complete.`);
+
   server.listen(PORT, '127.0.0.1', () => {
     console.log(`[SRV] Secure WebSocket Server running on wss://127.0.0.1:${PORT}`);
   });
@@ -780,8 +870,8 @@ wss.on('connection', (ws: WebSocket, req: IncomingMessage) => {
   console.log(`[SRV] New client connected from IP: ${ipAddress}. WS ID: ${wsId}`);
 
   ws.on('error', (error) => {
-    const clientId = clientDataMap.get(ws)?.username || wsId;
-    console.error(`[SRV] WebSocket error for: ${clientId}`, error);
+    const cid = clientDataMap.get(ws)?.username || wsId;
+    console.error(`[SRV] WebSocket error for: ${cid}`, error);
     handleDisconnect(ws);
   });
 
@@ -945,7 +1035,7 @@ wss.on('connection', (ws: WebSocket, req: IncomingMessage) => {
           });
         }
       }
-      return; // End of login logic
+      return;
     }
 
     // Actions Requiring Login
@@ -958,7 +1048,6 @@ wss.on('connection', (ws: WebSocket, req: IncomingMessage) => {
       return;
     }
     const currentUsername = clientInfo.username;
-    // const currentUserIp = clientInfo.ipAddress; // Available if needed
 
     // Handle Logout
     if (isLogoutMessage(parsedData)) {
@@ -1068,13 +1157,17 @@ wss.on('connection', (ws: WebSocket, req: IncomingMessage) => {
         });
         return;
       }
-      const mts: Omit<MessageHistoryDocument, 'timestamp'> = {
+
+      // Save Message to Firestore History
+      const messageToSave: Omit<MessageHistoryDocument, 'timestamp'> = {
         sender: currentUsername,
         messageContent: ptm,
         isBroadcast: isB,
         ...(recipient && { recipient: recipient }),
       };
-      await saveMessageToHistory(mts);
+      await saveMessageToHistory(messageToSave); // Asynchronously save
+
+      // Relay Logic
       if (isB) {
         console.log(`[SRV] Relaying broadcast message from ${currentUsername}`);
         let rc = 0;
@@ -1145,37 +1238,28 @@ wss.on('connection', (ws: WebSocket, req: IncomingMessage) => {
     // Handle Typing Indicators
     if (isStartTypingMessage(parsedData) || isStopTypingMessage(parsedData)) {
       const { recipient } = parsedData;
-      const isBroadcast = !recipient;
-      const messageType = isStartTypingMessage(parsedData)
+      const isB = !recipient;
+      const mt = isStartTypingMessage(parsedData)
         ? ServerMessageType.USER_TYPING
         : ServerMessageType.USER_STOPPED_TYPING;
-
-      const messageToSend: UserTypingMessage | UserStoppedTypingMessage = {
-        type: messageType,
+      const mts: UserTypingMessage | UserStoppedTypingMessage = {
+        type: mt,
         sender: currentUsername,
-        // Include recipient only if it was a private typing indicator
         ...(recipient && { recipient: recipient }),
       };
-
-      if (isBroadcast) {
-        // Broadcast to everyone EXCEPT the sender
-        // console.log(`[SRV] Broadcasting ${messageType} from ${currentUsername}`); // Can be noisy
-        wss.clients.forEach((client) => {
-          if (client !== ws && client.readyState === WebSocket.OPEN && clientDataMap.has(client)) {
-            sendToClient(client, messageToSend);
+      if (isB) {
+        wss.clients.forEach((c) => {
+          if (c !== ws && c.readyState === WebSocket.OPEN && clientDataMap.has(c)) {
+            sendToClient(c, mts);
           }
         });
       } else if (recipient) {
-        // Send only to the specified recipient
-        const recipientWs = clientsByName.get(recipient);
-        if (recipientWs && recipientWs.readyState === WebSocket.OPEN) {
-          // console.log(`[SRV] Sending ${messageType} from ${currentUsername} to ${recipient}`); // Can be noisy
-          sendToClient(recipientWs, messageToSend);
-        } else {
-          // console.log(`[SRV] Typing indicator not sent: Recipient ${recipient} offline.`); // Optional log
+        const rws = clientsByName.get(recipient);
+        if (rws && rws.readyState === WebSocket.OPEN) {
+          sendToClient(rws, mts);
         }
       }
-      return; // End typing indicator handling
+      return;
     }
 
     // Handle File Transfers
@@ -1290,13 +1374,9 @@ wss.on('connection', (ws: WebSocket, req: IncomingMessage) => {
   }); // End ws.on('message')
 
   ws.on('close', (code, reason) => {
-    const reasonString = reason ? reason.toString('utf8') : 'N/A';
-    const closedClientUsername = clientDataMap.get(ws)?.username;
-    console.log(
-      `[SRV] Connection closed for: ${
-        closedClientUsername || wsId
-      }, Code: ${code}, Reason: ${reasonString}`
-    );
+    const rs = reason ? reason.toString('utf8') : 'N/A';
+    const cun = clientDataMap.get(ws)?.username;
+    console.log(`[SRV] Connection closed for: ${cun || wsId}, Code: ${code}, Reason: ${rs}`);
     handleDisconnect(ws);
   });
 
@@ -1320,32 +1400,26 @@ wss.on('connection', (ws: WebSocket, req: IncomingMessage) => {
 // Graceful Shutdown
 const shutdown = async () => {
   console.log('[SRV] Shutting down server...');
-  heartbeatMap.forEach((intId) => clearInterval(intId));
+  heartbeatMap.forEach((intervalId) => clearInterval(intervalId));
   heartbeatMap.clear();
   console.log('[SRV] All heartbeats stopped.');
-  wss.clients.forEach((c) => {
-    if (c.readyState === WebSocket.OPEN) {
+  wss.clients.forEach((client) => {
+    if (client.readyState === WebSocket.OPEN) {
       try {
-        c.send(
+        client.send(
           JSON.stringify({ type: ServerMessageType.SYSTEM, content: 'Server is shutting down.' })
         );
-        c.close(1012, 'Server shutting down');
+        client.close(1012, 'Server shutting down');
       } catch (e) {
-        c.terminate();
+        client.terminate();
       }
     } else {
-      c.terminate();
+      client.terminate();
     }
   });
   console.log('[SRV] Notified clients and initiated closing connections.');
-  if (db) {
-    try {
-      await db.client.close();
-      console.log('[SRV-DB] MongoDB connection closed gracefully.');
-    } catch (err) {
-      console.error('[SRV-DB] Error closing MongoDB connection:', err);
-    }
-  }
+
+  // Close HTTPS server
   server.close((err) => {
     if (err) {
       console.error('[SRV] Error closing HTTPS server:', err);
@@ -1355,6 +1429,8 @@ const shutdown = async () => {
       process.exit(0);
     }
   });
+
+  // Force exit after timeout
   setTimeout(() => {
     console.error('[SRV] Forcefully shutting down due to timeout.');
     process.exit(1);
