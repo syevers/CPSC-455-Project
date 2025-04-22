@@ -65,4 +65,6 @@ and this project adheres to [Semantic Versioning](http://semver.org/).
 ![image](https://github.com/user-attachments/assets/87261200-d35b-4555-adc2-d698c466cebd)
 ![image](https://github.com/user-attachments/assets/8ce075c3-0e47-47d5-801d-9821a897c19b)
 
-
+## [0.3.3] - 2025-04-21
+- Switched from mongodb to Firebase Database
+- Added typing indicators
