@@ -759,7 +759,7 @@ async function startServer() {
   console.log(`[SRV] Initializing...`);
   try {
     const privKeyPem = process.env.APP_PRIVATE_KEY;
-    serverPublicKeyPem = process.env.APP_PUBLIC_KEY;
+    serverPublicKeyPem = process.env.APP_PUBLIC_KEY ?? null;
 
     if (!privKeyPem || !serverPublicKeyPem) {
       throw new Error(
@@ -780,8 +780,14 @@ async function startServer() {
   console.log(`[SRV] User accounts will be handled by Firestore.`);
   console.log(`[SRV] Initialization complete.`);
 
-  server.listen(PORT, '0.0.0.0', () => {
-    console.log(`[SRV] HTTP WebSocket Server running on http://0.0.0.0:${PORT}`);
+  const numericPort = typeof PORT === 'string' ? parseInt(PORT, 10) : PORT;
+  if (isNaN(numericPort)) {
+    console.error(`[SRV] Invalid PORT specified: ${PORT}. Using default 8080.`);
+  }
+  const portToListen = isNaN(numericPort) ? 8080 : numericPort;
+
+  server.listen(portToListen, '0.0.0.0', () => {
+    console.log(`[SRV] HTTP WebSocket Server running on http://0.0.0.0:${portToListen}`);
   });
 }
 
