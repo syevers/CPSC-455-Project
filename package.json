@@ -9,7 +9,7 @@
     "build": "webpack --mode production --config webpack.config.js",
     "lint": "eslint . --ext .js,.jsx,.ts,.tsx",
     "typecheck": "tsc --noEmit",
-    "build:server": "tsc src/server.ts --outDir dist --module esnext --target es2020 --esModuleInterop --resolveJsonModule --sourceMap --skipLibCheck",
+    "build:server": "tsc -p tsconfig.json src/server.ts",
     "server": "node dist/server.js",
     "start:server": "npm run build:server && npm run server",
     "dev:server": "tsx watch src/server.ts"
