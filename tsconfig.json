@@ -26,7 +26,7 @@
     // Build Tool Compatibility: Ensure each file can be safely transpiled without relying on others
     "isolatedModules": true,
     // Build Tool Compatibility: Let build tool (Webpack/Babel) handle JS emission, TS only type checks
-    "noEmit": true,
+    "noEmit": false,
     // Project Structure: Disallow JavaScript files in the TS codebase
     "allowJs": false,
 
