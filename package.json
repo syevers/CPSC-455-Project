@@ -9,7 +9,7 @@
     "build": "webpack --mode production --config webpack.config.js",
     "lint": "eslint . --ext .js,.jsx,.ts,.tsx",
     "typecheck": "tsc --noEmit",
-    "build:server": "tsc -p tsconfig.json src/server.ts",
+    "build:server": "tsc -p tsconfig.json",
     "server": "node dist/server.js",
     "start:server": "npm run build:server && npm run server",
     "dev:server": "tsx watch src/server.ts"
