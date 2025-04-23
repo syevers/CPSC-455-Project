@@ -9,7 +9,10 @@
     "build": "webpack --mode production --config webpack.config.js",
     "lint": "eslint . --ext .js,.jsx,.ts,.tsx",
     "typecheck": "tsc --noEmit",
-    "server": "tsx src/server.ts"
+    "build:server": "tsc src/server.ts --outDir dist --module esnext --target es2020 --esModuleInterop --resolveJsonModule --sourceMap --skipLibCheck",
+    "server": "node dist/server.js",
+    "start:server": "npm run build:server && npm run server",
+    "dev:server": "tsx watch src/server.ts"
   },
   "dependencies": {
     "@radix-ui/react-popover": "^1.1.7",
@@ -26,7 +29,8 @@
     "node": "^23.11.0",
     "react": "^19.0.0",
     "react-dom": "^19.0.0",
-    "react-textarea-autosize": "^8.5.9"
+    "react-textarea-autosize": "^8.5.9",
+    "ws": "^8.17.1"
   },
   "devDependencies": {
     "@babel/core": "^7.24.7",
@@ -40,6 +44,7 @@
     "@types/react": "^18.3.3",
     "@types/react-dom": "^18.3.0",
     "@types/webcrypto": "^0.0.30",
+    "@types/ws": "^8.5.10",
     "@typescript-eslint/eslint-plugin": "^7.14.1",
     "@typescript-eslint/parser": "^7.14.1",
     "autoprefixer": "^10.4.19",
