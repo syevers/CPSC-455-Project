@@ -35,18 +35,17 @@
     // Path Aliases: Define '@/*' as an alias for './src/*'
     "paths": {
       "@/*": ["./src/*"]
-    }
+    },
+    "outDir": "./dist"
   },
   // Files to include in the TypeScript program
   "include": [
-    "src/server.ts"
+    "src/server.ts" // Include all files within the src directory
   ],
   // Files/directories to exclude from compilation
   "exclude": [
     "node_modules", // Standard exclusion
-    "dist", // Exclude build output directory
-    "main.ts", // Exclude main process file (handled by tsconfig.main.json)
-    "preload.ts" // Exclude preload script file (handled by tsconfig.main.json)
+    "dist" // Exclude build output directory
     // Add any test file patterns if necessary, e.g., "**/*.test.ts"
   ]
 }
