@@ -39,7 +39,7 @@
   },
   // Files to include in the TypeScript program
   "include": [
-    "src/**/*" // Include all files within the src directory
+    "src/server.ts"
   ],
   // Files/directories to exclude from compilation
   "exclude": [
