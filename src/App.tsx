@@ -38,7 +38,8 @@ import {
 // Constants
 const MAX_FILE_SIZE = 10 * 1024 * 1024;
 const CHUNK_SIZE = 64 * 1024;
-const SERVER_URL = 'wss://127.0.0.1:8080';
+// UPDATED SERVER URL:
+const SERVER_URL = 'wss://cpsc-455-project-wiii.onrender.com';
 const ALL_CHAT_KEY = 'All Chat';
 const TYPING_TIMEOUT_MS = 2000; // Stop typing after 2 seconds of inactivity
 const TYPING_THROTTLE_MS = 5000; // Send START_TYPING max once every 5 seconds
@@ -818,7 +819,7 @@ function App(): React.ReactElement {
                   const dfb = await decryptAesGcm(
                     rs.aesKey,
                     rs.fileInfo.iv,
-                    bufferToBase64(teb.buffer)
+                    bufferToBase64(teb.buffer) // Pass the underlying ArrayBuffer
                   );
                   rs.status = 'complete';
                   const ft = rs.fileInfo.type || 'application/octet-stream';
@@ -1746,7 +1747,7 @@ function App(): React.ReactElement {
             </ScrollArea>
           </CardContent>
 
-          {/* Input Area  */}
+          {/* Input Area */}
           <CardFooter className="p-4 border-t bg-gray-50/80">
             {!isLoggedIn ? (
               /* Login Form */ <form onSubmit={handleLogin} className="w-full space-y-3">
@@ -1888,7 +1889,7 @@ function App(): React.ReactElement {
                         disabled={!isConnected || !serverPublicKey}
                         autoComplete="off"
                       />
-                      {/* Emoji Picker  */}
+                      {/* Emoji Picker */}
                       <Popover open={showEmojiPicker} onOpenChange={setShowEmojiPicker}>
                         <PopoverTrigger
                           className="absolute right-1 top-1/2 -translate-y-1/2 h-7 w-7 p-0 inline-flex items-center justify-center rounded-md text-sm font-medium transition-colors focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-ring disabled:pointer-events-none disabled:opacity-50 text-gray-500 hover:bg-accent hover:text-accent-foreground" // Styles copied from Button variant=ghost, size=icon
