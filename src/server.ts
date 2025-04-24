@@ -3,7 +3,7 @@ import crypto, { KeyObject } from 'crypto';
 import admin from 'firebase-admin';
 import type { FieldValue, Timestamp } from 'firebase-admin/firestore';
 import { existsSync, readFileSync } from 'fs';
-import type { IncomingMessage } from 'http';
+import type { IncomingMessage, ServerResponse } from 'http';
 import http from 'http';
 import path from 'path';
 import { WebSocket, WebSocketServer, type RawData } from 'ws';
@@ -67,7 +67,18 @@ try {
   process.exit(1);
 }
 
-const server = http.createServer();
+// Add a request listener to handle basic HTTP GET requests for the root path
+const server = http.createServer((req: IncomingMessage, res: ServerResponse) => {
+  if (req.method === 'GET' && req.url === '/') {
+    // Respond to health checks
+    res.writeHead(200, { 'Content-Type': 'text/plain' });
+    res.end('Server is running and ready for WebSocket connections.\n');
+  } else {
+    res.writeHead(404, { 'Content-Type': 'text/plain' });
+    res.end('Not Found\n');
+  }
+});
+
 const wss = new WebSocketServer({ server });
 
 const MAX_LOGIN_ATTEMPTS = 5;
