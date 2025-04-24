@@ -67,16 +67,20 @@ try {
   process.exit(1);
 }
 
-// Add a request listener to handle basic HTTP GET requests for the root path
+
+// Add a request listener to handle GET/HEAD / for health checks 
 const server = http.createServer((req: IncomingMessage, res: ServerResponse) => {
-  if (req.method === 'GET' && req.url === '/') {
-    // Respond to health checks
-    res.writeHead(200, { 'Content-Type': 'text/plain' });
-    res.end('Server is running and ready for WebSocket connections.\n');
-  } else {
-    res.writeHead(404, { 'Content-Type': 'text/plain' });
-    res.end('Not Found\n');
-  }
+  if (req.url === '/' && (req.method === 'GET' || req.method === 'HEAD')) {
+    res.writeHead(200, { 'Content-Type': 'text/plain' });
+    // End response: send body only for GET, none for HEAD
+    res.end('Server is running and ready for WebSocket connections.\n');
+  }
+  // Check if it's NOT a WebSocket upgrade request
+  else if (!req.headers.upgrade || req.headers.upgrade.toLowerCase() !== 'websocket') {
+    // It's some other HTTP request, respond with 404 Not Found
+    res.writeHead(404, { 'Content-Type': 'text/plain' });
+    res.end('Not Found\n');
+  }
 });
 
 const wss = new WebSocketServer({ server });
