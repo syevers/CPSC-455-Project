@@ -1,117 +1,87 @@
 import bcrypt from 'bcrypt';
 import crypto, { KeyObject } from 'crypto';
-import dotenv from 'dotenv'; // Import dotenv
 import admin from 'firebase-admin';
 import type { FieldValue, Timestamp } from 'firebase-admin/firestore';
-import { existsSync, readFileSync, writeFileSync } from 'fs';
+import { existsSync, readFileSync } from 'fs';
 import type { IncomingMessage } from 'http';
-import https from 'https';
+import http from 'http';
 import path from 'path';
-import { fileURLToPath } from 'url';
 import { WebSocket, WebSocketServer, type RawData } from 'ws';
 
-// Load environment variables from .env
-dotenv.config();
+const RENDER_DATA_PATH = '/var/render/data';
+const SERVER_KEY_PATH_PRIVATE = path.join(RENDER_DATA_PATH, 'certs/server_private.pem');
+const SERVER_KEY_PATH_PUBLIC = path.join(RENDER_DATA_PATH, 'certs/server_public.pem');
+const FIREBASE_KEY_PATH_ON_DISK = path.join(RENDER_DATA_PATH, 'firebase-key.json');
 
-// Constants and Setup
-const __filename = fileURLToPath(import.meta.url);
-const __dirname = path.dirname(__filename);
-const PORT = 8080;
-const options = {
-  key: readFileSync(path.join(__dirname, '../certs/private.pem')),
-  cert: readFileSync(path.join(__dirname, '../certs/public.pem')),
-};
-const ACCOUNTS_PATH = path.join(__dirname, 'accounts.json');
+const PORT = process.env.PORT || 8080;
+
 const RATE_LIMIT = 20;
 const RATE_LIMIT_BLOCK_DURATION = 10000;
 const HEARTBEAT_INTERVAL = 30000;
 const SALT_ROUNDS = 10;
 const MAX_FILE_SIZE = 10 * 1024 * 1024;
 const MAX_CHUNK_SIZE = 64 * 1024;
-const MAX_HISTORY_MESSAGES = 200; // Max total messages to return
+const MAX_HISTORY_MESSAGES = 200;
 const ALL_CHAT_KEY = 'All Chat';
-const FIRESTORE_HISTORY_COLLECTION = 'chatlogs'; // Firestore collection name
+const FIRESTORE_HISTORY_COLLECTION = 'chatlogs';
+const FIRESTORE_USERS_COLLECTION = 'users';
 
-// Firebase Admin Initialization
-let firestore: admin.firestore.Firestore | null = null; // Firestore instance
-let serviceAccount: any; // Define serviceAccount outside try block for logging in catch
+let firestore: admin.firestore.Firestore | null = null;
+let serviceAccount: any;
 
 try {
-  // Validate that environment variables are loaded
-  if (!process.env.FIREBASE_DATABASE_URL) {
-  }
-  if (!process.env.FIREBASE_SERVICE_ACCOUNT_KEY_PATH) {
+  if (process.env.FIREBASE_SERVICE_ACCOUNT) {
+    console.log('[SRV-DB] Initializing Firebase using FIREBASE_SERVICE_ACCOUNT env var.');
+    serviceAccount = JSON.parse(process.env.FIREBASE_SERVICE_ACCOUNT);
+    if (!serviceAccount || typeof serviceAccount !== 'object') {
+      throw new Error('Parsed FIREBASE_SERVICE_ACCOUNT is not a valid object.');
+    }
+    admin.initializeApp({
+      credential: admin.credential.cert(serviceAccount),
+    });
+  } else {
     throw new Error(
-      'FIREBASE_SERVICE_ACCOUNT_KEY_PATH is not defined in the environment variables.'
+      'Firebase credentials not configured. Set FIREBASE_SERVICE_ACCOUNT (with JSON content) environment variable on Render.'
     );
   }
 
-  // Construct the absolute path to the service account key
-  const serviceAccountPath = path.resolve(process.env.FIREBASE_SERVICE_ACCOUNT_KEY_PATH);
-
-  if (!existsSync(serviceAccountPath)) {
-    throw new Error(
-      `Firebase service account key file not found at path: ${serviceAccountPath}. Check FIREBASE_SERVICE_ACCOUNT_KEY_PATH in your .env file.`
-    );
-  }
-
-  // Load JSON using fs.readFileSync and JSON.parse
-  const serviceAccountJson = readFileSync(serviceAccountPath, 'utf8');
-  serviceAccount = JSON.parse(serviceAccountJson);
-
-  // Ensure serviceAccount is a valid object before proceeding
-  if (!serviceAccount || typeof serviceAccount !== 'object') {
-    throw new Error('Parsed service account is not a valid object.');
-  }
-
-  // Initialize
-  admin.initializeApp({
-    credential: admin.credential.cert(serviceAccount),
-  });
-
-  // Get Firestore instance
   firestore = admin.firestore();
-  // check Firestore instance
   if (firestore) {
     console.log('[SRV-DB] Firestore instance obtained successfully.');
   } else {
-    // This case should ideally not happen if initializeApp succeeded without error
     throw new Error('Failed to get Firestore instance from initialized app.');
   }
-
   console.log('[SRV-DB] Firebase Admin SDK initialized successfully for Firestore.');
 } catch (error: any) {
   console.error('[SRV-DB] FATAL: Failed to initialize Firebase Admin SDK:', error.message);
-  if (typeof serviceAccount !== 'undefined') {
-    console.error('[SRV-DB] Service Account Object causing error:', serviceAccount);
+  if (process.env.FIREBASE_SERVICE_ACCOUNT && typeof serviceAccount === 'undefined') {
+    console.error(
+      '[SRV-DB] Failed parsing FIREBASE_SERVICE_ACCOUNT environment variable JSON content.'
+    );
+  } else if (typeof serviceAccount !== 'undefined') {
+    console.error(
+      '[SRV-DB] Service Account Object (if parsed from FIREBASE_SERVICE_ACCOUNT):',
+      serviceAccount
+    );
   }
-  // Exit if Firebase cannot be initialized
   process.exit(1);
 }
 
-// WebSocket Server Initialization
-const server = https.createServer(options);
+const server = http.createServer();
 const wss = new WebSocketServer({ server });
 
-// Brute-Force Protection Constants (Unchanged)
 const MAX_LOGIN_ATTEMPTS = 5;
 const LOGIN_BLOCK_DURATION = 60 * 1000;
 const ATTEMPT_WINDOW = 5 * 60 * 1000;
 
-// Server Keys
 let serverPrivateKey: KeyObject | null = null;
 let serverPublicKeyPem: string | null = null;
 
-// Interfaces
 interface UserAccount {
   username: string;
   passwordHash: string;
 }
-interface AccountsData {
-  users: UserAccount[];
-}
 
-// Interface for Firestore document
 interface MessageHistoryDocument {
   timestamp: FieldValue;
   sender: string;
@@ -119,12 +89,10 @@ interface MessageHistoryDocument {
   isBroadcast: boolean;
   messageContent: string;
 }
-// Interface for data read from Firestore
 interface MessageHistoryData extends Omit<MessageHistoryDocument, 'timestamp'> {
   timestamp: Timestamp;
 }
 
-// Message Types
 enum ServerMessageType {
   SYSTEM = 'system',
   USER_LIST = 'userList',
@@ -158,7 +126,6 @@ enum ClientMessageType {
   STOP_TYPING = 'stop_typing',
 }
 
-// Message Interfaces
 interface BaseMessage {
   type: ClientMessageType | ServerMessageType;
 }
@@ -303,7 +270,6 @@ interface FileChunkReceiveMessage extends BaseMessage {
   isLastChunk: boolean;
 }
 
-// Type Guards
 function isLoginMessage(msg: any): msg is LoginMessage {
   return msg?.type === ClientMessageType.LOGIN && typeof msg.username === 'string';
 }
@@ -380,7 +346,6 @@ function isStopTypingMessage(msg: any): msg is StopTypingMessage {
   );
 }
 
-// Crypto Helper Functions
 function decryptWithServerKey(encryptedDataB64: string): Buffer | null {
   if (!serverPrivateKey) {
     console.error('[CRYPTO] Server private key not loaded.');
@@ -443,102 +408,87 @@ function decryptAesGcm(aesKey: Buffer, ivB64: string, ciphertextB64: string): st
   }
 }
 
-// Helper Functions
-function initializeAccountsFile(): AccountsData | null {
-  if (!existsSync(ACCOUNTS_PATH)) {
-    console.log('[SRV] Creating accounts.json:', ACCOUNTS_PATH);
-    const e: AccountsData = { users: [] };
-    try {
-      writeFileSync(ACCOUNTS_PATH, JSON.stringify(e, null, 2), 'utf8');
-      return e;
-    } catch (w) {
-      console.error('[SRV] Failed create accounts.json:', w);
-      return { users: [] };
-    }
+async function addNewUserToFirestore(username: string, password?: string): Promise<boolean> {
+  if (!firestore) {
+    console.error('[SRV-DB] Firestore not initialized. Cannot add user.');
+    return false;
   }
-  return null;
-}
-function loadAccounts(): AccountsData {
-  try {
-    const i = initializeAccountsFile();
-    if (i) return i;
-    const d = readFileSync(ACCOUNTS_PATH, 'utf8');
-    const p = JSON.parse(d);
-    if (!p || !Array.isArray(p.users)) {
-      throw new Error('Invalid format');
-    }
-    p.users = p.users
-      .map((u: any) => ({ username: u.username, passwordHash: u.passwordHash || '' }))
-      .filter(
-        (u: UserAccount | null): u is UserAccount => u !== null && u.username && u.passwordHash
-      );
-    return p as AccountsData;
-  } catch (e: any) {
-    console.error('[SRV] Error load/parse accounts.json:', e.message, '. Resetting.');
-    try {
-      const em: AccountsData = { users: [] };
-      writeFileSync(ACCOUNTS_PATH, JSON.stringify(em, null, 2), 'utf8');
-      return em;
-    } catch (w) {
-      console.error('[SRV] Failed reset accounts.json:', w);
-      return { users: [] };
-    }
-  }
-}
-function addNewUser(username: string, password?: string): boolean {
   if (!password) {
-    console.log('[SRV] No password for new user:', username);
+    console.log('[SRV] No password provided for new user:', username);
     return false;
   }
   try {
-    const a = loadAccounts();
-    if (a.users.some((u) => u.username.toLowerCase() === username.toLowerCase())) {
-      console.log('[SRV] User already exists:', username);
+    const usersCollection = firestore.collection(FIRESTORE_USERS_COLLECTION);
+    const querySnapshot = await usersCollection
+      .where('usernameLower', '==', username.toLowerCase())
+      .limit(1)
+      .get();
+
+    if (!querySnapshot.empty) {
+      console.log('[SRV-DB] User already exists (checked case-insensitively):', username);
       return false;
     }
-    const h = bcrypt.hashSync(password, SALT_ROUNDS);
-    a.users.push({ username, passwordHash: h });
-    writeFileSync(ACCOUNTS_PATH, JSON.stringify(a, null, 2), 'utf8');
-    console.log('[SRV] New user added successfully:', username);
+
+    const passwordHash = bcrypt.hashSync(password, SALT_ROUNDS);
+    await usersCollection.add({
+      username: username,
+      usernameLower: username.toLowerCase(),
+      passwordHash: passwordHash,
+      createdAt: admin.firestore.FieldValue.serverTimestamp(),
+    });
+
+    console.log('[SRV-DB] New user added successfully to Firestore:', username);
     return true;
   } catch (e) {
-    console.error('[SRV] Error adding new user:', e);
+    console.error('[SRV-DB] Error adding new user to Firestore:', e);
     return false;
   }
 }
-function validateCredentials(username: string, password?: string): boolean {
-  const accounts = loadAccounts();
-  if (!accounts || !Array.isArray(accounts.users)) {
-    console.error('[SRV] Invalid accounts data.');
+
+async function validateCredentialsWithFirestore(
+  username: string,
+  password?: string
+): Promise<boolean> {
+  if (!firestore) {
+    console.error('[SRV-DB] Firestore not initialized. Cannot validate credentials.');
     return false;
   }
+  if (!password) {
+    console.log(`[SRV] Login fail: Missing password for ${username}`);
+    return false;
+  }
+
   try {
-    const userAccount = accounts.users.find(
-      (usr) => usr.username.toLowerCase() === username.toLowerCase()
-    );
-    if (!userAccount) {
-      console.log('[SRV] User not found, creating:', username);
-      if (!password) {
-        console.log('[SRV] Cannot create user without password:', username);
-        return false;
-      }
-      return addNewUser(username, password);
+    const usersCollection = firestore.collection(FIRESTORE_USERS_COLLECTION);
+    const querySnapshot = await usersCollection
+      .where('usernameLower', '==', username.toLowerCase())
+      .limit(1)
+      .get();
+
+    if (querySnapshot.empty) {
+      console.log('[SRV-DB] User not found, creating in Firestore:', username);
+      return await addNewUserToFirestore(username, password);
     } else {
-      if (!password || !userAccount.passwordHash) {
-        console.log(`[SRV] Login fail: Missing password/hash for ${username}`);
+      const userDoc = querySnapshot.docs[0];
+      const userData = userDoc.data() as UserAccount;
+
+      if (!userData.passwordHash) {
+        console.log(`[SRV] Login fail: Missing password hash for ${username} in Firestore.`);
         return false;
       }
-      const isValid = bcrypt.compareSync(password, userAccount.passwordHash);
+
+      const isValid = bcrypt.compareSync(password, userData.passwordHash);
       if (!isValid) {
-        console.log(`[SRV] Login fail: Invalid password for ${username}`);
+        console.log(`[SRV] Login fail: Invalid password for ${username} (Firestore).`);
       }
       return isValid;
     }
   } catch (e) {
-    console.error('[SRV] Error during credential validation:', e);
+    console.error('[SRV-DB] Error during credential validation with Firestore:', e);
     return false;
   }
 }
+
 function checkRateLimit(ws: WebSocket): boolean {
   const n = Date.now();
   const t = messageTimestamps.get(ws) || [];
@@ -576,12 +526,6 @@ function checkRateLimit(ws: WebSocket): boolean {
   return true;
 }
 
-// Database Interaction Functions
-
-/**
- * Saves a message to Firestore.
- * @param messageData - The message data to save.
- */
 async function saveMessageToHistory(
   messageData: Omit<MessageHistoryDocument, 'timestamp'>
 ): Promise<void> {
@@ -591,10 +535,8 @@ async function saveMessageToHistory(
   }
   try {
     const historyCollection = firestore.collection(FIRESTORE_HISTORY_COLLECTION);
-    // Use add() to let Firestore generate a document ID
     await historyCollection.add({
       ...messageData,
-      // Use Firestore server timestamp
       timestamp: admin.firestore.FieldValue.serverTimestamp(),
     });
   } catch (error) {
@@ -602,12 +544,6 @@ async function saveMessageToHistory(
   }
 }
 
-/**
- * Fetches chat history for a given user from Firestore.
- * Uses multiple queries for potentially better efficiency than fetching all and filtering.
- * @param username - The username whose history is being fetched.
- * @returns A Promise resolving to the chat history formatted for the client.
- */
 async function fetchUserHistory(username: string): Promise<PersistedChatHistories> {
   const history: PersistedChatHistories = { [ALL_CHAT_KEY]: [] };
   if (!firestore) {
@@ -617,32 +553,27 @@ async function fetchUserHistory(username: string): Promise<PersistedChatHistorie
   const historyCollection = firestore.collection(FIRESTORE_HISTORY_COLLECTION);
 
   try {
-    // Fetch messages sent BY the user
     const sentQuery = historyCollection
       .where('sender', '==', username)
       .orderBy('timestamp', 'desc')
       .limit(MAX_HISTORY_MESSAGES);
 
-    // Fetch messages sent TO the user
     const receivedQuery = historyCollection
       .where('recipient', '==', username)
       .orderBy('timestamp', 'desc')
       .limit(MAX_HISTORY_MESSAGES);
 
-    // Fetch broadcast messages
     const broadcastQuery = historyCollection
       .where('isBroadcast', '==', true)
       .orderBy('timestamp', 'desc')
       .limit(MAX_HISTORY_MESSAGES);
 
-    // Execute queries in parallel
     const [sentSnapshot, receivedSnapshot, broadcastSnapshot] = await Promise.all([
       sentQuery.get(),
       receivedQuery.get(),
       broadcastQuery.get(),
     ]);
 
-    // Combine results and deduplicate
     const combinedMessages = new Map<string, MessageHistoryData>();
 
     sentSnapshot.forEach((doc) => combinedMessages.set(doc.id, doc.data() as MessageHistoryData));
@@ -653,19 +584,13 @@ async function fetchUserHistory(username: string): Promise<PersistedChatHistorie
       combinedMessages.set(doc.id, doc.data() as MessageHistoryData)
     );
 
-    // Convert map values to array, filter out any potentially null/invalid timestamps
     const validMessages = Array.from(combinedMessages.values()).filter((msg) => msg.timestamp);
 
-    // Sort combined results DESCENDING by timestamp
     validMessages.sort((a, b) => b.timestamp.toMillis() - a.timestamp.toMillis());
-    // Take the latest N messages overall
     const limitedMessages = validMessages.slice(0, MAX_HISTORY_MESSAGES);
-    // Reverse to get chronological order for client
     limitedMessages.reverse();
 
-    // Reconstruct the history object for the client
     limitedMessages.forEach((msg) => {
-      // Ensure timestamp is valid before processing
       if (!msg.timestamp || typeof msg.timestamp.toMillis !== 'function') {
         console.warn('[SRV-DB] Skipping message with invalid timestamp:', msg);
         return;
@@ -679,7 +604,7 @@ async function fetchUserHistory(username: string): Promise<PersistedChatHistorie
         content: msg.messageContent,
         sender: msg.sender,
         recipient: msg.sender === username ? msg.recipient : undefined,
-        timestamp: msg.timestamp.toMillis(), // Convert Firestore Timestamp to milliseconds
+        timestamp: msg.timestamp.toMillis(),
         isEncrypted: true,
       };
 
@@ -692,14 +617,13 @@ async function fetchUserHistory(username: string): Promise<PersistedChatHistorie
       history[peerKey].push(displayMsg);
     });
 
-    if (!history[ALL_CHAT_KEY]) history[ALL_CHAT_KEY] = []; // Ensure All Chat exists
+    if (!history[ALL_CHAT_KEY]) history[ALL_CHAT_KEY] = [];
     console.log(
       `[SRV-DB] Processed ${limitedMessages.length} history messages for ${username} from Firestore.`
     );
   } catch (error) {
     console.error(`[SRV-DB] Error fetching history for ${username} from Firestore:`, error);
     if ((error as any).code === 5 || (error as any).code === 'failed-precondition') {
-      // Check for NOT_FOUND or FAILED_PRECONDITION
       console.error(
         "[SRV-DB] Hint: Firestore query failed. This might be due to missing indexes or the collection '" +
           FIRESTORE_HISTORY_COLLECTION +
@@ -710,7 +634,6 @@ async function fetchUserHistory(username: string): Promise<PersistedChatHistorie
   return history;
 }
 
-// Broadcast/Send Functions
 function broadcastUserList() {
   const userList = Array.from(clientsByName.keys());
   console.log('[SRV] Broadcasting user list:', userList);
@@ -746,7 +669,6 @@ function sendToClient(ws: WebSocket, message: object) {
   }
 }
 
-// Connection Management
 function handleDisconnect(ws: WebSocket) {
   const cd = clientDataMap.get(ws);
   const un = cd?.username;
@@ -818,7 +740,6 @@ function stopHeartbeat(ws: WebSocket) {
   }
 }
 
-// State Management
 interface ClientData {
   username: string;
   ipAddress: string;
@@ -834,36 +755,42 @@ const rateLimitBlockedUsers = new Map<WebSocket, number>();
 const loginFailureCounts = new Map<string, { count: number; lastAttempt: number }>();
 const loginBlockedUsers = new Map<string, number>();
 
-// Main Server Startup Logic
 async function startServer() {
   console.log(`[SRV] Initializing...`);
-  // Load server keys
   try {
-    const privPath = path.join(__dirname, '../certs/server_private.pem');
-    const pubPath = path.join(__dirname, '../certs/server_public.pem');
-    if (!existsSync(privPath) || !existsSync(pubPath)) {
-      throw new Error(`Server key pair not found in certs/ directory.`);
+    const privKeyPem = process.env.APP_PRIVATE_KEY;
+    serverPublicKeyPem = process.env.APP_PUBLIC_KEY ?? null;
+
+    if (!privKeyPem || !serverPublicKeyPem) {
+      throw new Error(
+        'Server key pair not found in environment variables (APP_PRIVATE_KEY, APP_PUBLIC_KEY).'
+      );
     }
-    const privPem = readFileSync(privPath, 'utf8');
-    serverPublicKeyPem = readFileSync(pubPath, 'utf8');
-    serverPrivateKey = crypto.createPrivateKey(privPem);
-    console.log('[SRV] Server key pair loaded successfully.');
+
+    serverPrivateKey = crypto.createPrivateKey(privKeyPem);
+    console.log('[SRV] Server key pair loaded successfully from environment variables.');
   } catch (error: any) {
-    console.error('[SRV] Failed to load server key pair:', error.message);
+    console.error(
+      '[SRV] Failed to load server key pair from environment variables:',
+      error.message
+    );
     process.exit(1);
   }
 
-  // Load accounts
-  loadAccounts();
-  console.log(`[SRV] User accounts loaded.`);
+  console.log(`[SRV] User accounts will be handled by Firestore.`);
   console.log(`[SRV] Initialization complete.`);
 
-  server.listen(PORT, '127.0.0.1', () => {
-    console.log(`[SRV] Secure WebSocket Server running on wss://127.0.0.1:${PORT}`);
+  const numericPort = typeof PORT === 'string' ? parseInt(PORT, 10) : PORT;
+  if (isNaN(numericPort)) {
+    console.error(`[SRV] Invalid PORT specified: ${PORT}. Using default 8080.`);
+  }
+  const portToListen = isNaN(numericPort) ? 8080 : numericPort;
+
+  server.listen(portToListen, '0.0.0.0', () => {
+    console.log(`[SRV] HTTP WebSocket Server running on http://0.0.0.0:${portToListen}`);
   });
 }
 
-// Connection Handling
 wss.on('connection', (ws: WebSocket, req: IncomingMessage) => {
   const ipAddress = req.socket.remoteAddress || 'unknown';
   const wsId = ws.toString();
@@ -875,7 +802,6 @@ wss.on('connection', (ws: WebSocket, req: IncomingMessage) => {
     handleDisconnect(ws);
   });
 
-  // WebSocket Message Handler
   ws.on('message', async (data: RawData) => {
     const clientInfo = clientDataMap.get(ws);
     const clientIdForLog = clientInfo?.username || `WS ${wsId} (IP: ${ipAddress})`;
@@ -897,7 +823,6 @@ wss.on('connection', (ws: WebSocket, req: IncomingMessage) => {
       return;
     }
 
-    // Rate Limiting Check
     if (rateLimitBlockedUsers.has(ws) && Date.now() < rateLimitBlockedUsers.get(ws)!) {
       return;
     }
@@ -905,7 +830,6 @@ wss.on('connection', (ws: WebSocket, req: IncomingMessage) => {
       return;
     }
 
-    // Handle PONG
     if (isPongMessage(parsedData)) {
       if (clientInfo) {
         clientInfo.isAlive = true;
@@ -913,7 +837,6 @@ wss.on('connection', (ws: WebSocket, req: IncomingMessage) => {
       return;
     }
 
-    // Handle Login Attempt
     if (isLoginMessage(parsedData)) {
       if (clientInfo) {
         sendToClient(ws, {
@@ -971,9 +894,12 @@ wss.on('connection', (ws: WebSocket, req: IncomingMessage) => {
         });
         return;
       }
-      console.log(`[SRV] Validating credentials for: ${username}`);
-      if (validateCredentials(username, password)) {
-        console.log(`[SRV] Credentials VALID for ${username}.`);
+      console.log(`[SRV] Validating credentials for: ${username} using Firestore`);
+
+      const isValid = await validateCredentialsWithFirestore(username, password);
+
+      if (isValid) {
+        console.log(`[SRV] Credentials VALID for ${username} (Firestore).`);
         loginFailureCounts.delete(username);
         loginBlockedUsers.delete(username);
         const newClientData: ClientData = { username, ipAddress, isAlive: true };
@@ -1009,7 +935,7 @@ wss.on('connection', (ws: WebSocket, req: IncomingMessage) => {
           console.error(`[SRV] Error starting heartbeat for ${username}:`, e);
         }
       } else {
-        console.log(`[SRV] Login FAILED for: ${username}.`);
+        console.log(`[SRV] Login FAILED for: ${username} (Firestore).`);
         const fr = loginFailureCounts.get(username) || { count: 0, lastAttempt: 0 };
         if (now - fr.lastAttempt > ATTEMPT_WINDOW) {
           fr.count = 0;
@@ -1038,7 +964,6 @@ wss.on('connection', (ws: WebSocket, req: IncomingMessage) => {
       return;
     }
 
-    // Actions Requiring Login
     if (!clientInfo) {
       console.log(`[SRV] Action rejected: Client ${clientIdForLog} is not logged in.`);
       sendToClient(ws, {
@@ -1049,7 +974,6 @@ wss.on('connection', (ws: WebSocket, req: IncomingMessage) => {
     }
     const currentUsername = clientInfo.username;
 
-    // Handle Logout
     if (isLogoutMessage(parsedData)) {
       console.log(`[SRV] Received logout request from ${currentUsername}. WS ID: ${wsId}`);
       handleDisconnect(ws);
@@ -1061,7 +985,6 @@ wss.on('connection', (ws: WebSocket, req: IncomingMessage) => {
       return;
     }
 
-    // Handle Share Public Key
     if (isSharePublicKeyMessage(parsedData)) {
       const pk = parsedData.publicKey;
       console.log(`[SRV] Received public key (SPKI Base64) from ${currentUsername}`);
@@ -1090,7 +1013,6 @@ wss.on('connection', (ws: WebSocket, req: IncomingMessage) => {
       return;
     }
 
-    // Handle Request Public Key
     if (isRequestPublicKeyMessage(parsedData)) {
       const tu = parsedData.username;
       console.log(`[SRV] ${currentUsername} requested public key for ${tu}`);
@@ -1114,7 +1036,6 @@ wss.on('connection', (ws: WebSocket, req: IncomingMessage) => {
       return;
     }
 
-    // Handle Request History
     if (isRequestHistoryMessage(parsedData)) {
       console.log(`[SRV] Received history request from ${currentUsername}`);
       try {
@@ -1132,7 +1053,6 @@ wss.on('connection', (ws: WebSocket, req: IncomingMessage) => {
       return;
     }
 
-    // Handle Intermediary Encrypted Messages
     if (isClientSendMessage(parsedData)) {
       const { recipient, payload } = parsedData;
       const { iv, encryptedKey: ekfsb64, ciphertext: ctb64 } = payload;
@@ -1158,16 +1078,14 @@ wss.on('connection', (ws: WebSocket, req: IncomingMessage) => {
         return;
       }
 
-      // Save Message to Firestore History
       const messageToSave: Omit<MessageHistoryDocument, 'timestamp'> = {
         sender: currentUsername,
         messageContent: ptm,
         isBroadcast: isB,
         ...(recipient && { recipient: recipient }),
       };
-      await saveMessageToHistory(messageToSave); // Asynchronously save
+      await saveMessageToHistory(messageToSave);
 
-      // Relay Logic
       if (isB) {
         console.log(`[SRV] Relaying broadcast message from ${currentUsername}`);
         let rc = 0;
@@ -1235,7 +1153,6 @@ wss.on('connection', (ws: WebSocket, req: IncomingMessage) => {
       return;
     }
 
-    // Handle Typing Indicators
     if (isStartTypingMessage(parsedData) || isStopTypingMessage(parsedData)) {
       const { recipient } = parsedData;
       const isB = !recipient;
@@ -1262,7 +1179,6 @@ wss.on('connection', (ws: WebSocket, req: IncomingMessage) => {
       return;
     }
 
-    // Handle File Transfers
     if (isFileTransferRequest(parsedData)) {
       const { recipient, fileInfo } = parsedData;
       console.log(`[SRV] Received file transfer request from ${currentUsername} to ${recipient}`);
@@ -1363,7 +1279,6 @@ wss.on('connection', (ws: WebSocket, req: IncomingMessage) => {
       return;
     }
 
-    // Unhandled Message Type
     console.warn(
       `[SRV] Unhandled message type: '${(parsedData as any).type}' from: ${currentUsername}`
     );
@@ -1371,7 +1286,7 @@ wss.on('connection', (ws: WebSocket, req: IncomingMessage) => {
       type: ServerMessageType.SYSTEM,
       content: '[SRV]: Unrecognized message type.',
     });
-  }); // End ws.on('message')
+  });
 
   ws.on('close', (code, reason) => {
     const rs = reason ? reason.toString('utf8') : 'N/A';
@@ -1380,7 +1295,6 @@ wss.on('connection', (ws: WebSocket, req: IncomingMessage) => {
     handleDisconnect(ws);
   });
 
-  // Send initial welcome message
   try {
     if (ws.readyState === WebSocket.OPEN) {
       sendToClient(ws, {
@@ -1395,9 +1309,8 @@ wss.on('connection', (ws: WebSocket, req: IncomingMessage) => {
       ws.terminate();
     } catch (e) {}
   }
-}); // End wss.on('connection')
+});
 
-// Graceful Shutdown
 const shutdown = async () => {
   console.log('[SRV] Shutting down server...');
   heartbeatMap.forEach((intervalId) => clearInterval(intervalId));
@@ -1419,18 +1332,16 @@ const shutdown = async () => {
   });
   console.log('[SRV] Notified clients and initiated closing connections.');
 
-  // Close HTTPS server
   server.close((err) => {
     if (err) {
-      console.error('[SRV] Error closing HTTPS server:', err);
+      console.error('[SRV] Error closing HTTP server:', err);
       process.exit(1);
     } else {
-      console.log('[SRV] HTTPS Server closed gracefully.');
+      console.log('[SRV] HTTP Server closed gracefully.');
       process.exit(0);
     }
   });
 
-  // Force exit after timeout
   setTimeout(() => {
     console.error('[SRV] Forcefully shutting down due to timeout.');
     process.exit(1);
@@ -1439,7 +1350,6 @@ const shutdown = async () => {
 process.on('SIGTERM', shutdown);
 process.on('SIGINT', shutdown);
 
-// Start the Server
 startServer().catch((err) => {
   console.error('[SRV] Failed to start server:', err);
   process.exit(1);
