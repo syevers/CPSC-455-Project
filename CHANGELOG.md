@@ -68,3 +68,8 @@ and this project adheres to [Semantic Versioning](http://semver.org/).
 ## [0.3.3] - 2025-04-21
 - Switched from mongodb to Firebase Database
 - Added typing indicators
+![image](https://github.com/user-attachments/assets/ebe648c2-6e01-4ef3-b3b0-e0c421d21950)
+
+## [0.3.4] - 2024-04-23
+- Fully migrated from local backend to being hosted on render.com
+
