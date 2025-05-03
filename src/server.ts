@@ -2,6 +2,7 @@ import bcrypt from 'bcrypt';
 import crypto, { KeyObject } from 'crypto';
 import admin from 'firebase-admin';
 import type { FieldValue, Timestamp } from 'firebase-admin/firestore';
+import { getStorage, ref, uploadBytes, getDownloadURL } from 'firebase-admin/storage';
 import { existsSync, readFileSync } from 'fs';
 import type { IncomingMessage, ServerResponse } from 'http';
 import http from 'http';
@@ -20,13 +21,14 @@ const RATE_LIMIT_BLOCK_DURATION = 10000;
 const HEARTBEAT_INTERVAL = 30000;
 const SALT_ROUNDS = 10;
 const MAX_FILE_SIZE = 10 * 1024 * 1024;
-const MAX_CHUNK_SIZE = 64 * 1024;
 const MAX_HISTORY_MESSAGES = 200;
 const ALL_CHAT_KEY = 'All Chat';
 const FIRESTORE_HISTORY_COLLECTION = 'chatlogs';
 const FIRESTORE_USERS_COLLECTION = 'users';
+const STORAGE_BUCKET = process.env.FIREBASE_STORAGE_BUCKET;
 
 let firestore: admin.firestore.Firestore | null = null;
+let storage: admin.storage.Storage | null = null;
 let serviceAccount: any;
 
 try {
@@ -38,6 +40,7 @@ try {
     }
     admin.initializeApp({
       credential: admin.credential.cert(serviceAccount),
+      storageBucket: STORAGE_BUCKET,
     });
   } else {
     throw new Error(
@@ -46,38 +49,29 @@ try {
   }
 
   firestore = admin.firestore();
+  storage = getStorage();
   if (firestore) {
     console.log('[SRV-DB] Firestore instance obtained successfully.');
   } else {
     throw new Error('Failed to get Firestore instance from initialized app.');
   }
-  console.log('[SRV-DB] Firebase Admin SDK initialized successfully for Firestore.');
-} catch (error: any) {
-  console.error('[SRV-DB] FATAL: Failed to initialize Firebase Admin SDK:', error.message);
-  if (process.env.FIREBASE_SERVICE_ACCOUNT && typeof serviceAccount === 'undefined') {
-    console.error(
-      '[SRV-DB] Failed parsing FIREBASE_SERVICE_ACCOUNT environment variable JSON content.'
-    );
-  } else if (typeof serviceAccount !== 'undefined') {
-    console.error(
-      '[SRV-DB] Service Account Object (if parsed from FIREBASE_SERVICE_ACCOUNT):',
-      serviceAccount
-    );
+  if (storage) {
+    console.log('[SRV-STORAGE] Firebase Storage instance obtained successfully.');
+  } else {
+    throw new Error('Failed to get Storage instance from initialized app.');
   }
+  console.log('[SRV] Firebase Admin SDK initialized successfully for Firestore and Storage.');
+} catch (error: any) {
+  console.error('[SRV] FATAL: Failed to initialize Firebase Admin SDK:', error.message);
   process.exit(1);
 }
 
-
-// Add a request listener to handle GET/HEAD / for health checks 
+// HTTP server for health checks
 const server = http.createServer((req: IncomingMessage, res: ServerResponse) => {
   if (req.url === '/' && (req.method === 'GET' || req.method === 'HEAD')) {
     res.writeHead(200, { 'Content-Type': 'text/plain' });
-    // End response: send body only for GET, none for HEAD
     res.end('Server is running and ready for WebSocket connections.\n');
-  }
-  // Check if it's NOT a WebSocket upgrade request
-  else if (!req.headers.upgrade || req.headers.upgrade.toLowerCase() !== 'websocket') {
-    // It's some other HTTP request, respond with 404 Not Found
+  } else if (!req.headers.upgrade || req.headers.upgrade.toLowerCase() !== 'websocket') {
     res.writeHead(404, { 'Content-Type': 'text/plain' });
     res.end('Not Found\n');
   }
@@ -119,7 +113,7 @@ enum ServerMessageType {
   INCOMING_FILE_REQUEST = 'incoming_file_request',
   FILE_ACCEPT_NOTICE = 'file_accept_notice',
   FILE_REJECT_NOTICE = 'file_reject_notice',
-  FILE_CHUNK_RECEIVE = 'file_chunk_receive',
+  FILE_URL = 'file_url',
   RECEIVE_HISTORY = 'receive_history',
   USER_TYPING = 'user_typing',
   USER_STOPPED_TYPING = 'user_stopped_typing',
@@ -135,7 +129,7 @@ enum ClientMessageType {
   FILE_TRANSFER_REQUEST = 'file_transfer_request',
   FILE_TRANSFER_ACCEPT = 'file_transfer_accept',
   FILE_TRANSFER_REJECT = 'file_transfer_reject',
-  FILE_CHUNK = 'file_chunk',
+  FILE_UPLOAD = 'file_upload',
   REQUEST_HISTORY = 'request_history',
   START_TYPING = 'start_typing',
   STOP_TYPING = 'stop_typing',
@@ -253,13 +247,11 @@ interface FileTransferRejectMessage extends BaseMessage {
   sender: string;
   fileInfo: { name: string };
 }
-interface FileChunkMessage extends BaseMessage {
-  type: ClientMessageType.FILE_CHUNK;
+interface FileUploadMessage extends BaseMessage {
+  type: ClientMessageType.FILE_UPLOAD;
   recipient: string;
-  fileInfo: { name: string };
-  chunkData: string;
-  chunkIndex: number;
-  isLastChunk: boolean;
+  fileInfo: FileInfo;
+  fileData: string;
 }
 interface IncomingFileRequestMessage extends BaseMessage {
   type: ServerMessageType.INCOMING_FILE_REQUEST;
@@ -276,13 +268,11 @@ interface FileRejectNoticeMessage extends BaseMessage {
   recipient: string;
   fileInfo: { name: string };
 }
-interface FileChunkReceiveMessage extends BaseMessage {
-  type: ServerMessageType.FILE_CHUNK_RECEIVE;
+interface FileUrlMessage extends BaseMessage {
+  type: ServerMessageType.FILE_URL;
   sender: string;
-  fileInfo: { name: string };
-  chunkData: string;
-  chunkIndex: number;
-  isLastChunk: boolean;
+  fileInfo: { name: string; size: number; type: string };
+  downloadUrl: string;
 }
 
 function isLoginMessage(msg: any): msg is LoginMessage {
@@ -335,14 +325,16 @@ function isFileTransferReject(msg: any): msg is FileTransferRejectMessage {
     typeof msg.fileInfo?.name === 'string'
   );
 }
-function isFileChunk(msg: any): msg is FileChunkMessage {
+function isFileUpload(msg: any): msg is FileUploadMessage {
   return (
-    msg?.type === ClientMessageType.FILE_CHUNK &&
+    msg?.type === ClientMessageType.FILE_UPLOAD &&
     typeof msg.recipient === 'string' &&
     typeof msg.fileInfo?.name === 'string' &&
-    typeof msg.chunkData === 'string' &&
-    typeof msg.chunkIndex === 'number' &&
-    typeof msg.isLastChunk === 'boolean'
+    typeof msg.fileInfo?.size === 'number' &&
+    typeof msg.fileInfo?.type === 'string' &&
+    typeof msg.fileInfo?.iv === 'string' &&
+    typeof msg.fileInfo?.encryptedKey === 'string' &&
+    typeof msg.fileData === 'string'
   );
 }
 function isRequestHistoryMessage(msg: any): msg is RequestHistoryMessage {
@@ -824,7 +816,7 @@ wss.on('connection', (ws: WebSocket, req: IncomingMessage) => {
 
     let parsedData: BaseMessage;
     try {
-      if (messageString.length > MAX_CHUNK_SIZE * 1.5) {
+      if (messageString.length > MAX_FILE_SIZE) {
         console.warn(
           `[SRV] Large message (${messageString.length} bytes) received from ${clientIdForLog}. Discarding.`
         );
@@ -1265,30 +1257,61 @@ wss.on('connection', (ws: WebSocket, req: IncomingMessage) => {
       }
       return;
     }
-    if (isFileChunk(parsedData)) {
-      const { recipient, fileInfo, chunkData, chunkIndex, isLastChunk } = parsedData;
-      if (chunkData.length > MAX_CHUNK_SIZE * 1.4) {
-        console.warn(
-          `[SRV] Received oversized chunk from ${currentUsername} for ${recipient}. Discarding.`
-        );
-        return;
-      }
+    if (isFileUpload(parsedData)) {
+      const { recipient, fileInfo, fileData } = parsedData;
+      console.log(`[SRV] Received file upload from ${currentUsername} for ${recipient}`);
       const rws = clientsByName.get(recipient);
-      if (rws && rws.readyState === WebSocket.OPEN) {
-        const mts: FileChunkReceiveMessage = {
-          type: ServerMessageType.FILE_CHUNK_RECEIVE,
-          sender: currentUsername,
-          fileInfo: fileInfo,
-          chunkData: chunkData,
-          chunkIndex: chunkIndex,
-          isLastChunk: isLastChunk,
-        };
-        sendToClient(rws, mts);
-      } else {
-        console.log(`[SRV] File chunk relay failed: Recipient '${recipient}' offline.`);
+      if (!rws || rws.readyState !== WebSocket.OPEN) {
+        console.log(`[SRV] File upload failed: Recipient '${recipient}' offline.`);
         sendToClient(ws, {
           type: ServerMessageType.SYSTEM,
-          content: `[SRV]: User '${recipient}' went offline. File transfer failed.`,
+          content: `[SRV]: User '${recipient}' is offline. File transfer failed.`,
+        });
+        return;
+      }
+      if (!storage) {
+        console.error('[SRV-STORAGE] Storage not initialized. Cannot upload file.');
+        sendToClient(ws, {
+          type: ServerMessageType.SYSTEM,
+          content: '[SRV Error] Storage service unavailable.',
+        });
+        return;
+      }
+      try {
+        const fileBuffer = Buffer.from(fileData, 'base64');
+        const fileRef = ref(storage.bucket(), `chat_files/${Date.now()}_${fileInfo.name}`);
+        await uploadBytes(fileRef, fileBuffer, {
+          contentType: fileInfo.type,
+          metadata: {
+            customMetadata: {
+              sender: currentUsername,
+              recipient: recipient,
+              encrypted: 'true',
+            },
+          },
+        });
+        const downloadUrl = await getDownloadURL(fileRef);
+        console.log(`[SRV] File uploaded to Firebase Storage: ${fileInfo.name}, URL: ${downloadUrl}`);
+        const mts: FileUrlMessage = {
+          type: ServerMessageType.FILE_URL,
+          sender: currentUsername,
+          fileInfo: {
+            name: fileInfo.name,
+            size: fileInfo.size,
+            type: fileInfo.type,
+          },
+          downloadUrl: downloadUrl,
+        };
+        sendToClient(rws, mts);
+        sendToClient(ws, {
+          type: ServerMessageType.SYSTEM,
+          content: `File ${fileInfo.name} successfully uploaded and shared with ${recipient}.`,
+        });
+      } catch (e) {
+        console.error(`[SRV] Failed to upload file to Firebase Storage:`, e);
+        sendToClient(ws, {
+          type: ServerMessageType.SYSTEM,
+          content: `[SRV Error] Failed to upload file: ${e instanceof Error ? e.message : 'Unknown'}.`,
         });
       }
       return;

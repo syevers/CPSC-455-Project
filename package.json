@@ -24,13 +24,14 @@
     "dompurify": "^3.2.5",
     "emoji-picker-react": "^4.12.2",
     "firebase-admin": "^13.2.0",
+    "https": "^1.0.0",
     "marked": "^15.0.8",
     "mongodb": "^6.15.0",
     "node": "^23.11.0",
     "react": "^19.0.0",
     "react-dom": "^19.0.0",
     "react-textarea-autosize": "^8.5.9",
-    "ws": "^8.17.1"
+    "ws": "^8.18.2"
   },
   "devDependencies": {
     "@babel/core": "^7.24.7",

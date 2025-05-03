@@ -37,13 +37,22 @@ import {
 
 // Constants
 const MAX_FILE_SIZE = 10 * 1024 * 1024;
-const CHUNK_SIZE = 64 * 1024;
+
 // UPDATED SERVER URL:
 const SERVER_URL = 'wss://cpsc-455-project-wiii.onrender.com';
 const ALL_CHAT_KEY = 'All Chat';
 const TYPING_TIMEOUT_MS = 2000; // Stop typing after 2 seconds of inactivity
 const TYPING_THROTTLE_MS = 5000; // Send START_TYPING max once every 5 seconds
 
+// Basic Malware Scanning Configuration
+const ALLOWED_FILE_EXTENSIONS = [
+  '.txt', '.pdf', '.doc', '.docx', '.jpg', '.jpeg', '.png', '.gif', '.mp3', '.mp4',
+];
+const SUSPICIOUS_PATTERNS = [
+  /<script\b[^<]*(?:(?!<\/script>)<[^<]*)*<\/script>/gi, // JavaScript tags
+  /eval\(/gi, // eval() function
+  /document\.execCommand/gi, // Potential malicious commands
+];
 // Crypto Helper Functions
 const bufferToBase64 = (buffer: ArrayBuffer): string => {
   let b = '';
@@ -151,6 +160,49 @@ const decryptRsaOaep = async (privateKey: CryptoKey, base64Data: string): Promis
   }
 };
 
+// Basic Malware Scanning Function
+const scanFileForMalware = async (file: File): Promise<{ isSafe: boolean; message: string }> => {
+  // Check file size
+  if (file.size > MAX_FILE_SIZE) {
+    return { isSafe: false, message: `
+
+File size exceeds maximum limit of ${MAX_FILE_SIZE / 1024 / 1024}MB.` };
+  }
+
+  // Check file extension
+  const extension = '.' + file.name.split('.').pop()?.toLowerCase();
+  if (!extension || !ALLOWED_FILE_EXTENSIONS.includes(extension)) {
+    return {
+      isSafe: false,
+      message: `File type not allowed. Allowed types: ${ALLOWED_FILE_EXTENSIONS.join(', ')}`,
+    };
+  }
+
+  // Basic content scanning (for text-based or scriptable files)
+  if (
+    file.type.startsWith('text/') ||
+    file.type.includes('javascript') ||
+    file.type.includes('html')
+  ) {
+    try {
+      const text = await file.text();
+      for (const pattern of SUSPICIOUS_PATTERNS) {
+        if (pattern.test(text)) {
+          return {
+            isSafe: false,
+            message: 'File contains potentially malicious content (suspicious script detected).',
+          };
+        }
+      }
+    } catch (e) {
+      return { isSafe: false, message: 'Failed to scan file content.' };
+    }
+  }
+
+  // Additional checks could be added here (e.g., magic number validation for images/PDFs)
+  return { isSafe: true, message: 'File appears safe.' };
+};
+
 // Message Types
 enum ClientMessageType {
   LOGIN = 'login',
@@ -163,7 +215,7 @@ enum ClientMessageType {
   FILE_TRANSFER_REQUEST = 'file_transfer_request',
   FILE_TRANSFER_ACCEPT = 'file_transfer_accept',
   FILE_TRANSFER_REJECT = 'file_transfer_reject',
-  FILE_CHUNK = 'file_chunk',
+  FILE_UPLOAD = 'file_upload',
   REQUEST_HISTORY = 'request_history',
   START_TYPING = 'start_typing',
   STOP_TYPING = 'stop_typing',
@@ -179,7 +231,7 @@ enum ServerMessageType {
   INCOMING_FILE_REQUEST = 'incoming_file_request',
   FILE_ACCEPT_NOTICE = 'file_accept_notice',
   FILE_REJECT_NOTICE = 'file_reject_notice',
-  FILE_CHUNK_RECEIVE = 'file_chunk_receive',
+  FILE_URL = 'file_url',
   RECEIVE_HISTORY = 'receive_history',
   USER_TYPING = 'user_typing',
   USER_STOPPED_TYPING = 'user_stopped_typing',
@@ -238,13 +290,11 @@ interface FileRejectNoticeMessage extends ServerMessageBase {
   recipient: string;
   fileInfo: { name: string };
 }
-interface FileChunkReceiveMessage extends ServerMessageBase {
-  type: ServerMessageType.FILE_CHUNK_RECEIVE;
+interface FileUrlMessage extends ServerMessageBase {
+  type: ServerMessageType.FILE_URL;
   sender: string;
-  fileInfo: { name: string };
-  chunkData: string;
-  chunkIndex: number;
-  isLastChunk: boolean;
+  fileInfo: { name: string; size: number; type: string };
+  downloadUrl: string;
 }
 // History Interfaces
 interface PersistedDisplayMessage {
@@ -285,7 +335,7 @@ type ServerMessage =
   | IncomingFileRequestMessage
   | FileAcceptNoticeMessage
   | FileRejectNoticeMessage
-  | FileChunkReceiveMessage
+  | FileUrlMessage
   | ReceiveHistoryMessage
   | UserTypingMessage
   | UserStoppedTypingMessage;
