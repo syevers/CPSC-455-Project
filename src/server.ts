@@ -2,7 +2,7 @@ import bcrypt from 'bcrypt';
 import crypto, { KeyObject } from 'crypto';
 import admin from 'firebase-admin';
 import type { FieldValue, Timestamp } from 'firebase-admin/firestore';
-import { getStorage, ref, uploadBytes, getDownloadURL } from 'firebase-admin/storage';
+import { getStorage } from 'firebase-admin/storage';
 import { existsSync, readFileSync } from 'fs';
 import type { IncomingMessage, ServerResponse } from 'http';
 import http from 'http';
@@ -32,6 +32,11 @@ let storage: admin.storage.Storage | null = null;
 let serviceAccount: any;
 
 try {
+  if (!STORAGE_BUCKET) {
+    throw new Error(
+      'Firebase Storage bucket name not configured. Set FIREBASE_STORAGE_BUCKET environment variable.'
+    );
+  }
   if (process.env.FIREBASE_SERVICE_ACCOUNT) {
     console.log('[SRV-DB] Initializing Firebase using FIREBASE_SERVICE_ACCOUNT env var.');
     serviceAccount = JSON.parse(process.env.FIREBASE_SERVICE_ACCOUNT);
@@ -42,6 +47,7 @@ try {
       credential: admin.credential.cert(serviceAccount),
       storageBucket: STORAGE_BUCKET,
     });
+    console.log('[SRV] Firebase Admin SDK initialized successfully.');
   } else {
     throw new Error(
       'Firebase credentials not configured. Set FIREBASE_SERVICE_ACCOUNT (with JSON content) environment variable on Render.'
@@ -816,7 +822,7 @@ wss.on('connection', (ws: WebSocket, req: IncomingMessage) => {
 
     let parsedData: BaseMessage;
     try {
-      if (messageString.length > MAX_FILE_SIZE) {
+      if (messageString.length > MAX_FILE_SIZE + 1024 * 1024) {
         console.warn(
           `[SRV] Large message (${messageString.length} bytes) received from ${clientIdForLog}. Discarding.`
         );
@@ -1277,21 +1283,42 @@ wss.on('connection', (ws: WebSocket, req: IncomingMessage) => {
         });
         return;
       }
+
+      if (fileInfo.size > MAX_FILE_SIZE) {
+        console.warn(`[SRV] File upload rejected by server: File too large (${fileInfo.size} bytes).`);
+        sendToClient(ws, {
+          type: ServerMessageType.SYSTEM,
+          content: `File rejected by server: Exceeds size limit of ${MAX_FILE_SIZE / 1024 / 1024}MB.`,
+        });
+        return;
+      }
       try {
         const fileBuffer = Buffer.from(fileData, 'base64');
-        const fileRef = ref(storage.bucket(), `chat_files/${Date.now()}_${fileInfo.name}`);
-        await uploadBytes(fileRef, fileBuffer, {
+        const bucket = storage.bucket();
+        const destinationPath = `chat_files/${Date.now()}_${fileInfo.name}`;
+        const file = bucket.file(destinationPath);
+        await file.save(fileBuffer, {
           contentType: fileInfo.type,
           metadata: {
-            customMetadata: {
+            // Custom metadata needs to be nested under 'metadata' key
+            metadata: {
               sender: currentUsername,
               recipient: recipient,
-              encrypted: 'true',
+              ncrypted: 'true',
+              originalName: fileInfo.name,
+              iv: fileInfo.iv,
+              encryptedKey: fileInfo.encryptedKey // Store encrypted key needed for decryption
             },
           },
         });
-        const downloadUrl = await getDownloadURL(fileRef);
-        console.log(`[SRV] File uploaded to Firebase Storage: ${fileInfo.name}, URL: ${downloadUrl}`);
+        console.log(`[SRV] File uploaded to Firebase Storage: ${destinationPath}`);
+        const [downloadUrl] = await file.getSignedUrl({
+          action: 'read',
+          expires: Date.now() + 1000 * 60 * 60 * 24 * 7, // Link expires in 7 days
+        });
+
+        console.log(`[SRV] Generated download URL for ${fileInfo.name}`);
+
         const mts: FileUrlMessage = {
           type: ServerMessageType.FILE_URL,
           sender: currentUsername,
@@ -1308,7 +1335,7 @@ wss.on('connection', (ws: WebSocket, req: IncomingMessage) => {
           content: `File ${fileInfo.name} successfully uploaded and shared with ${recipient}.`,
         });
       } catch (e) {
-        console.error(`[SRV] Failed to upload file to Firebase Storage:`, e);
+        console.error('[SRV] Failed to upload file to Firebase Storage:', e);
         sendToClient(ws, {
           type: ServerMessageType.SYSTEM,
           content: `[SRV Error] Failed to upload file: ${e instanceof Error ? e.message : 'Unknown'}.`,
