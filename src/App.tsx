@@ -47,6 +47,7 @@ const TYPING_THROTTLE_MS = 5000; // Send START_TYPING max once every 5 seconds
 // Basic Malware Scanning Configuration
 const ALLOWED_FILE_EXTENSIONS = [
   '.txt', '.pdf', '.doc', '.docx', '.jpg', '.jpeg', '.png', '.gif', '.mp3', '.mp4',
+  '.zip', '.rar', '.7z', '.csv', '.xls', '.xlsx', '.ppt', '.pptx', '.md',
 ];
 const SUSPICIOUS_PATTERNS = [
   /<script\b[^<]*(?:(?!<\/script>)<[^<]*)*<\/script>/gi, // JavaScript tags
@@ -372,18 +373,13 @@ interface SendingFileState {
   encryptedContent: ArrayBuffer | null;
   recipient: string;
   fileInfo: FileInfo;
-  totalChunks: number;
-  nextChunkIndex: number;
-  status: 'pending_accept' | 'sending' | 'complete' | 'rejected' | 'error';
+  status: 'pending_accept' | 'uploading' | 'complete' | 'rejected' | 'error';
 }
 interface ReceivingFileState {
   id: string;
   sender: string;
   fileInfo: FileInfo;
-  aesKey: CryptoKey | null;
-  chunks: ArrayBuffer[];
-  receivedBytes: number;
-  status: 'receiving' | 'complete' | 'error' | 'decrypting';
+  status: 'pending_user_action' | 'accepted' | 'rejected';
 }
 
 // Helper to generate unique IDs
@@ -556,382 +552,314 @@ function App(): React.ReactElement {
         console.error('[WS] WebSocket Error:', event);
         isConnecting.current = false;
       };
+    };
 
-      // onmessage Handler
-      currentRunWs.onmessage = async (event: MessageEvent) => {
-        if (ws.current !== currentRunWs || !isEffectMounted) return;
-        try {
-          const message = JSON.parse(event.data as string) as ServerMessage;
-          switch (message.type) {
-            case ServerMessageType.SYSTEM: {
-              const content = message.content ?? '';
-              if (content === 'Login successful!') {
-                const loggedInUsername = usernameRef.current;
-                if (!loggedInUsername) {
-                  console.error('CRITICAL: usernameRef is empty!');
-                  setLoginError('Login failed: Internal error.');
-                  setIsLoggedIn(false);
-                  setCurrentUsername('');
-                  break;
-                }
-                setCurrentUsername(loggedInUsername);
-                setIsLoggedIn(true);
-                setLoginError('');
-                setSystemMessage('');
-                setUsername('');
-                setPassword('');
-                addMessageToHistory(ALL_CHAT_KEY, {
-                  type: 'system',
-                  content: `[SERVER]: ${content}`,
-                });
-                hasSharedKey.current = false;
-                console.log('[WS] Login successful, requesting history...');
-                setIsHistoryLoading(true);
-                sendData({ type: ClientMessageType.REQUEST_HISTORY });
-              } else if (content.startsWith('Login failed')) {
-                setLoginError(content);
-                setSystemMessage('');
-                setIsLoggedIn(false);
-                setCurrentUsername('');
-                usernameRef.current = '';
-              } else {
-                if (!content.startsWith('Public key for user'))
-                  addMessageToHistory(ALL_CHAT_KEY, {
-                    type: 'system',
-                    content: `[SERVER]: ${content}`,
-                  });
-              }
+    const handleServerMessage = async (event: MessageEvent) => {
+      if (ws.current !== localWsInstance || !isEffectMounted) return;
+      try {
+        const message = JSON.parse(event.data as string) as ServerMessage;
+        switch (message.type) {
+        case ServerMessageType.SYSTEM: {
+          const content = message.content ?? '';
+          if (content === 'Login successful!') {
+            const loggedInUsername = usernameRef.current;
+            if (!loggedInUsername) {
+              console.error('CRITICAL: usernameRef is empty!');
+              setLoginError('Login failed: Internal error.');
+              setIsLoggedIn(false);
+              setCurrentUsername('');
               break;
             }
-            case ServerMessageType.RECEIVE_HISTORY: {
-              console.log('[WS] Received history from server.');
-              setIsHistoryLoading(false);
-              if (message.history && typeof message.history === 'object') {
-                setChatHistories(message.history as ChatHistories);
-                console.log('[WS] History applied to state.');
-              } else {
-                console.error('[WS] Invalid history data received:', message.history);
-                addMessageToHistory(ALL_CHAT_KEY, {
-                  type: 'error',
-                  content: '[Error] Failed to load chat history.',
-                });
-              }
-              break;
-            }
-            case ServerMessageType.USER_TYPING: {
-              const { sender, recipient } = message;
-              const peerKey = recipient
-                ? sender === currentUsername
-                  ? recipient
-                  : sender
-                : ALL_CHAT_KEY;
-              setTypingUsers((prev) => {
-                const uc = new Set(prev[peerKey] || []);
-                uc.add(sender);
-                return { ...prev, [peerKey]: uc };
+            setCurrentUsername(loggedInUsername);
+            setIsLoggedIn(true);
+            setLoginError('');
+            setSystemMessage('');
+            setUsername('');
+            setPassword('');
+            addMessageToHistory(ALL_CHAT_KEY, {
+              type: 'system',
+              content: `[SERVER]: ${content}`,
+            });
+            hasSharedKey.current = false;
+            console.log('[WS] Login successful, requesting history...');
+            setIsHistoryLoading(true);
+            sendData({ type: ClientMessageType.REQUEST_HISTORY });
+          } else if (content.startsWith('Login failed')) {
+            setLoginError(content);
+            setSystemMessage('');
+            setIsLoggedIn(false);
+            setCurrentUsername('');
+            usernameRef.current = '';
+          } else {
+            if (!content.startsWith('Public key for user')) {
+              addMessageToHistory(ALL_CHAT_KEY, {
+                type: 'system',
+                content: `[SERVER]: ${content}`,
               });
-              break;
-            }
-            case ServerMessageType.USER_STOPPED_TYPING: {
-              const { sender, recipient } = message;
-              const peerKey = recipient
-                ? sender === currentUsername
-                  ? recipient
-                  : sender
-                : ALL_CHAT_KEY;
-              setTypingUsers((prev) => {
-                const uc = new Set(prev[peerKey] || []);
-                uc.delete(sender);
-                if (uc.size === 0) {
-                  const ns = { ...prev };
-                  delete ns[peerKey];
-                  return ns;
-                }
-                return { ...prev, [peerKey]: uc };
-              });
-              break;
-            }
-            case ServerMessageType.USER_LIST: {
-              const nu = message.users ?? [];
-              const lu = usernameRef.current;
-              // Update the online users list state
-              setUsers(nu);
-              // Check if the currently selected user went offline
-              if (selectedUser && !nu.includes(selectedUser)) {
-                addMessageToHistory(selectedUser, {
-                  type: 'system',
-                  content: `User ${selectedUser} went offline.`,
-                });
-                // Don't deselect the user, just update their status indicator in the sidebar
-                // setSelectedUser(null); // Keep the conversation selected
-              }
-              // Update peer public keys (request missing keys for newly online users)
-              setPeerPublicKeys((pk) => {
-                const uk = new Map(pk);
-                let c = false;
-                // Remove keys for users who are no longer online (optional, could keep keys)
-                // Array.from(uk.keys()).forEach((u) => { if (!nu.includes(u)) { uk.delete(u); c = true; } });
-                if (lu) {
-                  nu.forEach((u) => {
-                    if (u !== lu && !uk.has(u)) {
-                      // Request key only if not already present
-                      console.log(`[WS] Requesting public key for newly online user: ${u}`);
-                      sendData({ type: ClientMessageType.REQUEST_PUBLIC_KEY, username: u });
-                    }
-                  });
-                }
-                return c ? uk : pk; // Return existing map if no keys were removed
-              });
-              break;
-            }
-            case ServerMessageType.SERVER_PUBLIC_KEY: {
-              try {
-                const ik = await importPublicKeyPem(message.publicKey);
-                setServerPublicKey(ik);
-              } catch (e) {
-                console.error('[ERROR] Failed to import server public key:', e);
-                setLoginError('Error processing server key.');
-                if (ws.current) ws.current.close();
-              }
-              break;
-            }
-            case ServerMessageType.RECEIVE_PUBLIC_KEY: {
-              try {
-                const ik = await importUserPublicKey(message.publicKey);
-                setPeerPublicKeys((p) => new Map(p).set(message.username, ik));
-                if (selectedUser === message.username)
-                  addMessageToHistory(selectedUser, {
-                    type: 'system',
-                    content: `Encryption key received for ${selectedUser}.`,
-                  });
-              } catch (ie) {
-                console.error(`Failed to import public key for ${message.username}:`, ie);
-                addMessageToHistory(message.username, {
-                  type: 'error',
-                  content: `Invalid key from ${message.username}.`,
-                });
-              }
-              break;
-            }
-            case ServerMessageType.RECEIVE_MESSAGE: {
-              const { sender, isBroadcast, payload } = message;
-              const { iv, encryptedKey, ciphertext } = payload;
-              const mpk = keyPairRef.current?.privateKey;
-              if (!mpk) {
-                addMessageToHistory(isBroadcast ? ALL_CHAT_KEY : sender, {
-                  type: 'error',
-                  content: '[Error] Cannot decrypt: Missing private key.',
-                });
-                break;
-              }
-              try {
-                const akb = await decryptRsaOaep(mpk, encryptedKey);
-                const ak = await importAesKeyRaw(bufferToBase64(akb));
-                const dc = await decryptAesGcm(ak, iv, ciphertext);
-                const dt = new TextDecoder().decode(dc);
-                addMessageToHistory(isBroadcast ? ALL_CHAT_KEY : sender, {
-                  type: 'chat',
-                  content: dt,
-                  sender: sender,
-                  isEncrypted: true,
-                });
-              } catch (de) {
-                console.error(`Failed to decrypt message from ${sender}:`, de);
-                addMessageToHistory(isBroadcast ? ALL_CHAT_KEY : sender, {
-                  type: 'error',
-                  content: `[Decryption Failed from ${sender}]`,
-                  sender: sender,
-                });
-              }
-              break;
-            }
-            case ServerMessageType.PING: {
-              try {
-                sendData({ type: ClientMessageType.PONG });
-              } catch (e) {
-                console.error('[ERROR] Failed to send PONG:', e);
-              }
-              break;
-            }
-            case ServerMessageType.INCOMING_FILE_REQUEST: {
-              const { sender, fileInfo } = message;
-              const tid = generateUniqueId();
-              const req: FileTransferRequest = { id: tid, sender, fileInfo, timestamp: Date.now() };
-              setIncomingFileRequests((p) => new Map(p).set(tid, req));
-              addMessageToHistory(sender, {
-                type: 'file_request',
-                sender,
-                content: `Wants to send you a file:`,
-                fileInfo,
-                transferId: tid,
-              });
-              break;
-            }
-            case ServerMessageType.FILE_ACCEPT_NOTICE: {
-              const { recipient, fileInfo } = message;
-              let tid: string | null = null;
-              sendingFiles.current.forEach((s, id) => {
-                if (
-                  s.recipient === recipient &&
-                  s.fileInfo.name === fileInfo.name &&
-                  s.status === 'pending_accept'
-                )
-                  tid = id;
-              });
-              if (tid && sendingFiles.current.has(tid)) {
-                const ss = sendingFiles.current.get(tid)!;
-                if (ss.encryptedContent) {
-                  ss.status = 'sending';
-                  addMessageToHistory(recipient, {
-                    type: 'file_notice',
-                    content: `User accepted file: ${fileInfo.name}. Sending...`,
-                    transferId: tid,
-                  });
-                  sendChunk(tid, ss);
-                } else {
-                  sendingFiles.current.delete(tid);
-                  addMessageToHistory(recipient, {
-                    type: 'error',
-                    content: `Error starting transfer: Missing content.`,
-                    transferId: tid,
-                  });
-                }
-              }
-              break;
-            }
-            case ServerMessageType.FILE_REJECT_NOTICE: {
-              const { recipient, fileInfo } = message;
-              let tid: string | null = null;
-              sendingFiles.current.forEach((s, id) => {
-                if (
-                  s.recipient === recipient &&
-                  s.fileInfo.name === fileInfo.name &&
-                  s.status === 'pending_accept'
-                )
-                  tid = id;
-              });
-              if (tid) {
-                sendingFiles.current.delete(tid);
-                addMessageToHistory(recipient, {
-                  type: 'file_notice',
-                  content: `User rejected file: ${fileInfo.name}`,
-                  transferId: tid,
-                });
-                setTransferProgress((p) => {
-                  const n = { ...p };
-                  delete n[tid!];
-                  return n;
-                });
-              }
-              break;
-            }
-            case ServerMessageType.FILE_CHUNK_RECEIVE: {
-              const { sender, fileInfo, chunkData, chunkIndex, isLastChunk } = message;
-              let tid: string | null = null;
-              receivingFiles.current.forEach((s, id) => {
-                if (
-                  s.sender === sender &&
-                  s.fileInfo.name === fileInfo.name &&
-                  s.status === 'receiving'
-                )
-                  tid = id;
-              });
-              if (!tid || !receivingFiles.current.has(tid)) break;
-              const rs = receivingFiles.current.get(tid)!;
-              if (!rs.aesKey) {
-                receivingFiles.current.delete(tid);
-                addMessageToHistory(sender, {
-                  type: 'error',
-                  content: `Transfer error: Missing key.`,
-                  transferId: tid,
-                });
-                break;
-              }
-              try {
-                const cb = base64ToBuffer(chunkData);
-                rs.chunks.push(cb);
-                rs.receivedBytes += cb.byteLength;
-                const pr = Math.round((rs.receivedBytes / rs.fileInfo.size) * 100);
-                setTransferProgress((p) => ({ ...p, [tid!]: pr }));
-                if (isLastChunk) {
-                  rs.status = 'decrypting';
-                  addMessageToHistory(sender, {
-                    type: 'file_notice',
-                    content: `File received: ${fileInfo.name}. Decrypting...`,
-                    transferId: tid,
-                  });
-                  const teb = new Uint8Array(rs.receivedBytes);
-                  let o = 0;
-                  for (const c of rs.chunks) {
-                    teb.set(new Uint8Array(c), o);
-                    o += c.byteLength;
-                  }
-                  const dfb = await decryptAesGcm(
-                    rs.aesKey,
-                    rs.fileInfo.iv,
-                    bufferToBase64(teb.buffer) // Pass the underlying ArrayBuffer
-                  );
-                  rs.status = 'complete';
-                  const ft = rs.fileInfo.type || 'application/octet-stream';
-                  const blob = new Blob([dfb], { type: ft });
-                  const ou = URL.createObjectURL(blob);
-                  if (ft.startsWith('image/')) {
-                    addMessageToHistory(sender, {
-                      type: 'file_image',
-                      sender,
-                      content: `Received image: ${fileInfo.name}`,
-                      fileInfo: rs.fileInfo,
-                      transferId: tid,
-                      objectUrl: ou,
-                    });
-                  } else {
-                    const a = document.createElement('a');
-                    a.href = ou;
-                    a.download = rs.fileInfo.name;
-                    document.body.appendChild(a);
-                    a.click();
-                    document.body.removeChild(a);
-                    URL.revokeObjectURL(ou);
-                    addMessageToHistory(sender, {
-                      type: 'file_notice',
-                      content: `File downloaded: ${fileInfo.name}`,
-                      transferId: tid,
-                    });
-                  }
-                  receivingFiles.current.delete(tid);
-                  setTransferProgress((p) => {
-                    const n = { ...p };
-                    delete n[tid!];
-                    return n;
-                  });
-                }
-              } catch (e) {
-                receivingFiles.current.delete(tid);
-                addMessageToHistory(sender, {
-                  type: 'error',
-                  content: `Transfer failed: ${e instanceof Error ? e.message : 'Unknown'}`,
-                  transferId: tid,
-                });
-                setTransferProgress((p) => {
-                  const n = { ...p };
-                  delete n[tid!];
-                  return n;
-                });
-              }
-              break;
-            }
-            default:
-              console.warn('[WS] Unhandled server message type:', (message as any).type);
           }
-        } catch (error) {
-          console.error('[WS] Error processing message:', error, 'Raw:', event.data);
-          addMessageToHistory(ALL_CHAT_KEY, {
-            type: 'error',
-            content: `[Client Error]: Failed processing message.`,
-          });
+          break;
         }
-      }; // End onmessage
-    }; // End connect
+        case ServerMessageType.RECEIVE_HISTORY: {
+          console.log('[WS] Received history from server.');
+          setIsHistoryLoading(false);
+          if (message.history && typeof message.history === 'object') {
+            setChatHistories(message.history as ChatHistories);
+            console.log('[WS] History applied to state.');
+          } else {
+            console.error('[WS] Invalid history data received:', message.history);
+            addMessageToHistory(ALL_CHAT_KEY, {
+              type: 'error',
+              content: '[Error] Failed to load chat history.',
+            });
+          }
+          break;
+        }
+        case ServerMessageType.USER_TYPING: {
+          const { sender, recipient } = message;
+          const peerKey = recipient
+            ? sender === currentUsername
+              ? recipient
+              : sender
+            : ALL_CHAT_KEY;
+          setTypingUsers((prev) => {
+            const uc = new Set(prev[peerKey] || []);
+            uc.add(sender);
+            return { ...prev, [peerKey]: uc };
+          });
+          break;
+        }
+        case ServerMessageType.USER_STOPPED_TYPING: {
+          const { sender, recipient } = message;
+          const peerKey = recipient
+            ? sender === currentUsername
+              ? recipient
+              : sender
+            : ALL_CHAT_KEY;
+          setTypingUsers((prev) => {
+            const uc = new Set(prev[peerKey] || []);
+            uc.delete(sender);
+            if (uc.size === 0) {
+              const ns = { ...prev };
+              delete ns[peerKey];
+              return ns;
+            }
+            return { ...prev, [peerKey]: uc };
+          });
+          break;
+        }
+        case ServerMessageType.USER_LIST: {
+          const nu = message.users ?? [];
+          const lu = usernameRef.current;
+          // Update the online users list state
+          setUsers(nu);
+          // Check if the currently selected user went offline
+          if (selectedUser && !nu.includes(selectedUser)) {
+            addMessageToHistory(selectedUser, {
+              type: 'system',
+              content: `User ${selectedUser} went offline.`,
+            });
+            // Don't deselect the user, just update their status indicator in the sidebar
+            // setSelectedUser(null); // Keep the conversation selected
+          }
+          // Update peer public keys (request missing keys for newly online users)
+          setPeerPublicKeys((pk) => {
+            const uk = new Map(pk);
+            let c = false;
+            // Remove keys for users who are no longer online (optional, could keep keys)
+            // Array.from(uk.keys()).forEach((u) => { if (!nu.includes(u)) { uk.delete(u); c = true; } });
+            if (lu) {
+              nu.forEach((u) => {
+                if (u !== lu && !uk.has(u)) {
+                  // Request key only if not already present
+                  console.log(`[WS] Requesting public key for newly online user: ${u}`);
+                  sendData({ type: ClientMessageType.REQUEST_PUBLIC_KEY, username: u });
+                }
+              });
+            }
+            return c ? uk : pk; // Return existing map if no keys were removed
+          });
+          break;
+        }
+        case ServerMessageType.SERVER_PUBLIC_KEY: {
+          try {
+            const ik = await importPublicKeyPem(message.publicKey);
+            setServerPublicKey(ik);
+          } catch (e) {
+            console.error('[ERROR] Failed to import server public key:', e);
+            setLoginError('Error processing server key.');
+            if (ws.current) ws.current.close();
+          }
+          break;
+        }
+        case ServerMessageType.RECEIVE_PUBLIC_KEY: {
+          try {
+            const ik = await importUserPublicKey(message.publicKey);
+            setPeerPublicKeys((p) => new Map(p).set(message.username, ik));
+            if (selectedUser === message.username)
+              addMessageToHistory(selectedUser, {
+                type: 'system',
+                content: `Encryption key received for ${selectedUser}.`,
+              });
+          } catch (ie) {
+            console.error(`Failed to import public key for ${message.username}:`, ie);
+            addMessageToHistory(message.username, {
+              type: 'error',
+              content: `Invalid key from ${message.username}.`,
+            });
+          }
+          break;
+        }
+        case ServerMessageType.RECEIVE_MESSAGE: {
+          const { sender, isBroadcast, payload } = message;
+          const { iv, encryptedKey, ciphertext } = payload;
+          const mpk = keyPairRef.current?.privateKey;
+          if (!mpk) {
+            addMessageToHistory(isBroadcast ? ALL_CHAT_KEY : sender, {
+              type: 'error',
+              content: '[Error] Cannot decrypt: Missing private key.',
+            });
+            break;
+          }
+          try {
+            const akb = await decryptRsaOaep(mpk, encryptedKey);
+            const ak = await importAesKeyRaw(bufferToBase64(akb));
+            const dc = await decryptAesGcm(ak, iv, ciphertext);
+            const dt = new TextDecoder().decode(dc);
+            addMessageToHistory(isBroadcast ? ALL_CHAT_KEY : sender, {
+              type: 'chat',
+              content: dt,
+              sender: sender,
+              isEncrypted: true,
+            });
+          } catch (de) {
+            console.error(`Failed to decrypt message from ${sender}:`, de);
+            addMessageToHistory(isBroadcast ? ALL_CHAT_KEY : sender, {
+              type: 'error',
+              content: `[Decryption Failed from ${sender}]`,
+              sender: sender,
+            });
+          }
+          break;
+        }
+        case ServerMessageType.PING: {
+          try {
+            sendData({ type: ClientMessageType.PONG });
+          } catch (e) {
+            console.error('[ERROR] Failed to send PONG:', e);
+          }
+          break;
+        }
+        case ServerMessageType.INCOMING_FILE_REQUEST: {
+          const { sender, fileInfo } = message;
+          const tid = generateUniqueId();
+          const req: FileTransferRequest = { id: tid, sender, fileInfo, timestamp: Date.now() };
+          setIncomingFileRequests((p) => new Map(p).set(tid, req));
+          addMessageToHistory(sender, {
+            type: 'file_request',
+            sender,
+            content: `Wants to send you a file:`,
+            fileInfo,
+            transferId: tid,
+          });
+          break;
+        }
+        case ServerMessageType.FILE_ACCEPT_NOTICE: {
+          const { recipient, fileInfo } = message;
+          let transferId: string | null = null;
+          let sendingState: SendingFileState | null = null;
+
+          sendingFiles.current.forEach((state, id) => {
+            if (
+              s.recipient === recipient &&
+                  s.fileInfo.name === fileInfo.name &&
+                  s.status === 'pending_accept'
+            ) {
+              transferId = id;
+              sendingState = state;
+            }
+          });
+
+          if (transferId && sendingState) {
+            console.log(`[WS] Received acceptance for transfer ${transferId}. Preparing upload...`);
+            sendingState.status = 'uploading'; // Update status
+            setTransferProgress((p) => ({ ...p, [transferId!]: 'Uploading...' })); // Show "Uploading..."
+
+            addMessageToHistory(recipient, {
+              type: 'file_notice',
+              content: `User accepted file: ${fileInfo.name}. Uploading...`,
+              transferId: transferId,
+            });
+
+            try {
+              // Read the file content as ArrayBuffer
+              const fileBuffer = await sendingState.file.arrayBuffer();
+              // Encode the buffer to base64
+              const fileData = bufferToBase64(fileBuffer);
+
+              // Send the FILE_UPLOAD message with all data
+              sendData({
+                type: ClientMessageType.FILE_UPLOAD,
+                recipient: sendingState.recipient,
+                fileInfo: sendingState.fileInfo, // Send the original FileInfo (contains keys/iv)
+                fileData: fileData, // Send the base64 encoded file content
+              });
+
+              console.log(`[WS] Sent FILE_UPLOAD message for transfer ${transferId}`);
+
+            } catch (error) {
+              console.error(`[Error] Failed to read or encode file for transfer ${transferId}:`, error);
+              sendingState.status = 'error';
+              addMessageToHistory(recipient, {
+                type: 'error',
+                content: `Error preparing file for upload: ${error instanceof Error ? error.message : 'Unknown error'}`,
+                transferId: transferId,
+              });
+              setTransferProgress((p) => ({ ...p, [transferId!]: 'Error' }));
+              sendingFiles.current.delete(transferId); // Clean up failed state
+            }
+          } else {
+            console.warn(`[WS] Received FILE_ACCEPT_NOTICE for unknown or already handled transfer:`, message);
+          }
+          break;
+        }
+        case ServerMessageType.FILE_REJECT_NOTICE: {
+          const { recipient, fileInfo } = message;
+          let tid: string | null = null;
+          sendingFiles.current.forEach((s, id) => { if ( s.recipient === recipient && s.fileInfo.name === fileInfo.name && s.status === 'pending_accept' ) tid = id; });
+          if (tid) {
+            sendingFiles.current.delete(tid); // Remove the pending state
+            addMessageToHistory(recipient, { type: 'file_notice', content: `User rejected file: ${fileInfo.name}`, transferId: tid });
+            setTransferProgress((p) => { const n = { ...p }; delete n[tid!]; return n; });
+          }
+          break;
+        }
+        case ServerMessageType.FILE_URL: {
+          const { sender, fileInfo, downloadUrl } = message;
+          console.log(`[WS] Received file URL from ${sender} for ${fileInfo.name}`);
+          addMessageToHistory(sender, {
+            type: 'file_notice', // Or potentially a new type like 'file_ready'
+            sender: sender,
+            content: `Received file: ${fileInfo.name}. Click to download.`,
+            fileInfo: fileInfo,
+            downloadUrl: downloadUrl, // Store the URL for the download button
+            // transferId might not be relevant here anymore, depends on flow
+          });
+          break;
+        }
+        default:
+          console.warn('[WS] Unhandled server message type:', (message as any).type);
+        }
+      } catch (error) {
+        console.error('[WS] Error processing message:', error, 'Raw:', event.data);
+        addMessageToHistory(ALL_CHAT_KEY, {
+          type: 'error',
+          content: `[Client Error]: Failed processing message.`,
+        });
+      }
+    };
+    if (ws.current) {
+      ws.current.onmessage = handleServerMessage; // Assign the handler
+    }
     if (connectTimeoutId.current) clearTimeout(connectTimeoutId.current);
     connectTimeoutId.current = setTimeout(() => {
       if (isEffectMounted) connect();
@@ -1184,19 +1112,22 @@ function App(): React.ReactElement {
     }
   };
   const handleSelectMainChat = () => setSelectedUser(null);
-  const handleFileChange = (event: React.ChangeEvent<HTMLInputElement>) => {
+  const handleFileChange = async (event: React.ChangeEvent<HTMLInputElement>) => {
     const f = event.target.files?.[0];
     if (f) {
-      if (f.size > MAX_FILE_SIZE) {
-        addMessageToHistory(currentChatKey, { type: 'error', content: `File too large.` });
+      const scanResult = await scanFileForMalware(f);
+      if (!scanResult.isSafe) {
+        addMessageToHistory(currentChatKey, { type: 'error', content: `File rejected by scan: ${scanResult.message}` });
         setSelectedFile(null);
-      } else {
-        setSelectedFile(f);
+        if (fileInputRef.current) fileInputRef.current.value = ''; // Clear input
+        return;
       }
-      if (fileInputRef.current) fileInputRef.current.value = '';
-    } else {
-      setSelectedFile(null);
-    }
+        setSelectedFile(f);
+        addMessageToHistory(currentChatKey, { type: 'system', content: `Selected file: ${f.name}. Ready to send request.`});
+      } else {
+        setSelectedFile(null);
+      }
+    if (fileInputRef.current) fileInputRef.current.value = '';
   };
   const handleSendFile = async () => {
     if (!selectedFile || !selectedUser || !isLoggedIn || !isConnected) {
@@ -1238,14 +1169,11 @@ function App(): React.ReactElement {
         iv: ivb64,
         encryptedKey: ekb64,
       };
-      const tc = Math.ceil(ecb.byteLength / CHUNK_SIZE);
       const ss: SendingFileState = {
         file: f,
         encryptedContent: ecb,
         recipient: selectedUser,
         fileInfo: fi,
-        totalChunks: tc,
-        nextChunkIndex: 0,
         status: 'pending_accept',
       };
       sendingFiles.current.set(tid, ss);
@@ -1341,48 +1269,29 @@ function App(): React.ReactElement {
       return;
     }
     const { sender, fileInfo } = r;
-    try {
-      const akb = await decryptRsaOaep(keyPairRef.current.privateKey, fileInfo.encryptedKey);
-      const ak = await importAesKeyRaw(bufferToBase64(akb));
-      const rs: ReceivingFileState = {
-        id: transferId,
-        sender,
-        fileInfo,
-        aesKey: ak,
-        chunks: [],
-        receivedBytes: 0,
-        status: 'receiving',
-      };
-      receivingFiles.current.set(transferId, rs);
-      setTransferProgress((p) => ({ ...p, [transferId]: 0 }));
-      setIncomingFileRequests((p) => {
-        const n = new Map(p);
-        n.delete(transferId);
-        return n;
-      });
-      sendData({
-        type: ClientMessageType.FILE_TRANSFER_ACCEPT,
-        sender,
-        fileInfo: { name: fileInfo.name, size: fileInfo.size },
-      });
-      addMessageToHistory(sender, {
-        type: 'file_notice',
-        content: `Accepted file: ${fileInfo.name}. Receiving...`,
-        transferId,
-      });
-    } catch (e) {
-      addMessageToHistory(sender, {
-        type: 'error',
-        content: `Accept failed: ${e instanceof Error ? e.message : 'Error'}`,
-        transferId,
-      });
-      setIncomingFileRequests((p) => {
-        const n = new Map(p);
-        n.delete(transferId);
-        return n;
-      });
-    }
+    setIncomingFileRequests((p) => {
+      const n = new Map(p);
+      n.delete(transferId);
+      return n;
+    });
+    sendData({
+      type: ClientMessageType.FILE_TRANSFER_ACCEPT,
+      sender,
+      fileInfo: { name: fileInfo.name, size: fileInfo.size },
+    });
+    addMessageToHistory(sender, {
+      type: 'file_notice',
+      content: `Accepted file: ${fileInfo.name}. Receiving...`,
+      transferId,
+    });
+    addMessageToHistory(sender, {
+      type: 'error',
+      content: `Accept failed: ${e instanceof Error ? e.message : 'Error'}`,
+      transferId,
+    });
+    console.log(`[WS] Sent FILE_TRANSFER_ACCEPT for transfer ${transferId}`);
   };
+
   const handleRejectFile = (transferId: string) => {
     const r = incomingFileRequests.get(transferId);
     if (!r) return;
@@ -1403,11 +1312,16 @@ function App(): React.ReactElement {
       transferId,
     });
   };
-  const handleDownloadFile = (objectUrl: string | undefined, filename: string | undefined) => {
-    if (!objectUrl || !filename) return;
+  const handleDownloadFile = (downloadUrl: string | undefined, filename: string | undefined) => {
+    if (!downloadUrl || !filename) {
+      addMessageToHistory(currentChatKey, {type: 'error', content: 'Download URL or filename missing.'});
+      return;
+    }
+    console.log(`Attempting to download ${filename} from ${downloadUrl}`);
     const a = document.createElement('a');
-    a.href = objectUrl;
+    a.href = downloadUrl;
     a.download = filename;
+    a.target = '_blank';
     document.body.appendChild(a);
     a.click();
     document.body.removeChild(a);
@@ -1608,8 +1522,8 @@ function App(): React.ReactElement {
                   const messageKey = msg.transferId
                     ? `${msg.transferId}-${msg.type}-${index}`
                     : msg.timestamp
-                    ? `${msg.timestamp}-${index}`
-                    : `msg-${index}`;
+                      ? `${msg.timestamp}-${index}`
+                      : `msg-${index}`;
                   // File Transfer Messages (Non-persisted)
                   if (msg.type === 'file_request' && msg.transferId && msg.fileInfo) {
                     const r = incomingFileRequests.get(msg.transferId);
@@ -1845,8 +1759,8 @@ function App(): React.ReactElement {
                   {!keyPairRef.current
                     ? 'Generating Keys...'
                     : !isConnected
-                    ? 'Connecting...'
-                    : 'Login / Register'}{' '}
+                      ? 'Connecting...'
+                      : 'Login / Register'}{' '}
                 </Button>{' '}
               </form>
             ) : (
