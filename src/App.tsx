@@ -210,10 +210,7 @@ enum ClientMessageType {
   REQUEST_PUBLIC_KEY = 'request_public_key',
   PING = 'ping',
   PONG = 'pong',
-  FILE_TRANSFER_REQUEST = 'file_transfer_request',
-  FILE_TRANSFER_ACCEPT = 'file_transfer_accept',
-  FILE_TRANSFER_REJECT = 'file_transfer_reject',
-  FILE_UPLOAD = 'file_upload',
+  FILE_SCAN_COMPLETE = 'file_scan_complete',
   REQUEST_HISTORY = 'request_history',
   START_TYPING = 'start_typing',
   STOP_TYPING = 'stop_typing',
@@ -226,10 +223,8 @@ enum ServerMessageType {
   RECEIVE_PUBLIC_KEY = 'receive_public_key',
   PONG = 'pong',
   PING = 'ping',
-  INCOMING_FILE_REQUEST = 'incoming_file_request',
-  FILE_ACCEPT_NOTICE = 'file_accept_notice',
-  FILE_REJECT_NOTICE = 'file_reject_notice',
-  FILE_URL = 'file_url',
+  FILE_SCAN_VERIFIED_CLEAN = 'file_scan_verified_clean',
+  FILE_SCAN_FAILED = 'file_scan_failed',
   RECEIVE_HISTORY = 'receive_history',
   USER_TYPING = 'user_typing',
   USER_STOPPED_TYPING = 'user_stopped_typing',
@@ -265,35 +260,7 @@ interface ServerReceiveMessage extends ServerMessageBase {
   isBroadcast: boolean;
   payload: { iv: string; encryptedKey: string; ciphertext: string };
 }
-// File Transfer Interfaces
-interface FileInfo {
-  name: string;
-  size: number;
-  type: string;
-  iv: string;
-  encryptedKey: string;
-}
-interface IncomingFileRequestMessage extends ServerMessageBase {
-  type: ServerMessageType.INCOMING_FILE_REQUEST;
-  sender: string;
-  fileInfo: FileInfo;
-}
-interface FileAcceptNoticeMessage extends ServerMessageBase {
-  type: ServerMessageType.FILE_ACCEPT_NOTICE;
-  recipient: string;
-  fileInfo: { name: string; size: number };
-}
-interface FileRejectNoticeMessage extends ServerMessageBase {
-  type: ServerMessageType.FILE_REJECT_NOTICE;
-  recipient: string;
-  fileInfo: { name: string };
-}
-interface FileUrlMessage extends ServerMessageBase {
-  type: ServerMessageType.FILE_URL;
-  sender: string;
-  fileInfo: { name: string; size: number; type: string };
-  downloadUrl: string;
-}
+
 // History Interfaces
 interface PersistedDisplayMessage {
   type: 'system' | 'chat' | 'my_chat' | 'error';
@@ -321,7 +288,17 @@ interface UserStoppedTypingMessage extends ServerMessageBase {
   sender: string;
   recipient?: string;
 }
-
+interface FileScanVerifiedCleanMessage extends ServerMessageBase {
+  type: ServerMessageType.FILE_SCAN_VERIFIED_CLEAN;
+  fileInfo: { name: string };
+  uploadUrl?: string;
+  firebasePath?: string;
+}
+interface FileScanFailedMessage extends ServerMessageBase {
+  type: ServerMessageType.FILE_SCAN_FAILED;
+  fileInfo: { name: string };
+  reason: string;
+}
 // Combined type for all possible server messages
 type ServerMessage =
   | SystemMessage
@@ -330,25 +307,33 @@ type ServerMessage =
   | ServerPublicKeyMessage
   | ServerReceiveMessage
   | PingMessage
-  | IncomingFileRequestMessage
-  | FileAcceptNoticeMessage
-  | FileRejectNoticeMessage
-  | FileUrlMessage
+  | FileScanVerifiedCleanMessage
+  | FileScanFailedMessage
   | ReceiveHistoryMessage
   | UserTypingMessage
   | UserStoppedTypingMessage;
 
+  interface DisplayFileInfo {
+    name: string;
+    size?: number;
+    type?: string;
+    firebasePath?: string;
+    sender?: string;
+}
+
+type DisplayMessageType = 'system' | 'chat' | 'my_chat' | 'error' | 'file_notice' | 'file_image'| 'file_download_link';
 // UI State Interfaces
 interface DisplayMessage {
-  type: 'system' | 'chat' | 'my_chat' | 'error' | 'file_request' | 'file_notice' | 'file_image';
+  type: DisplayMessageType;
   content: string | React.ReactNode;
   sender?: string;
   recipient?: string;
   timestamp?: number;
   isEncrypted?: boolean;
-  fileInfo?: FileInfo | { name: string; size?: number; type?: string };
-  transferId?: string;
+  fileInfo?: DisplayFileInfo;
   objectUrl?: string;
+  uploadProgress?: number;
+  isUploading?: boolean;
 }
 interface ChatHistories {
   [peerUsernameOrAllChat: string]: DisplayMessage[];
@@ -357,28 +342,6 @@ interface ChatHistories {
 interface TypingUsersState {
   [peerKey: string]: Set<string>;
 }
-
-// File Transfer State Interfaces
-interface FileTransferRequest {
-  id: string;
-  sender: string;
-  fileInfo: FileInfo;
-  timestamp: number;
-}
-interface SendingFileState {
-  file: File;
-  encryptedContent: ArrayBuffer | null;
-  recipient: string;
-  fileInfo: FileInfo;
-  status: 'pending_accept' | 'uploading' | 'complete' | 'rejected' | 'error';
-}
-interface ReceivingFileState {
-  id: string;
-  sender: string;
-  fileInfo: FileInfo;
-  status: 'pending_user_action' | 'accepted' | 'rejected';
-}
-
 // Helper to generate unique IDs
 const generateUniqueId = () =>
   `transfer_${Date.now()}_${Math.random().toString(36).substring(2, 9)}`;
@@ -411,12 +374,6 @@ function App(): React.ReactElement {
   const [serverPublicKey, setServerPublicKey] = useState<CryptoKey | null>(null);
   const fileInputRef = useRef<HTMLInputElement | null>(null);
   const [selectedFile, setSelectedFile] = useState<File | null>(null);
-  const [incomingFileRequests, setIncomingFileRequests] = useState<
-    Map<string, FileTransferRequest>
-  >(new Map());
-  const sendingFiles = useRef<Map<string, SendingFileState>>(new Map());
-  const receivingFiles = useRef<Map<string, ReceivingFileState>>(new Map());
-  const [transferProgress, setTransferProgress] = useState<{ [transferId: string]: number }>({});
   const [showEmojiPicker, setShowEmojiPicker] = useState<boolean>(false);
   const messageInputRef = useRef<HTMLTextAreaElement>(null);
   const [isHistoryLoading, setIsHistoryLoading] = useState<boolean>(false);
@@ -424,6 +381,8 @@ function App(): React.ReactElement {
   const [typingUsers, setTypingUsers] = useState<TypingUsersState>({});
   const typingTimeoutRef = useRef<NodeJS.Timeout | null>(null); // Timeout for STOP_TYPING
   const typingSentTimestampRef = useRef<number>(0); // Throttle START_TYPING
+  const [pendingFileUploads, setPendingFileUploads] = useState<Map<string, File>>(new Map());
+  const [uploadProgressMap, setUploadProgressMap] = useState<Map<string, number>>(new Map());
 
   // Effects
   const currentChatKey = selectedUser ?? ALL_CHAT_KEY;
@@ -436,13 +395,6 @@ function App(): React.ReactElement {
       const newMessage = { ...message, timestamp: Date.now() };
       setChatHistories((prev) => {
         const history = prev[peerKey] || [];
-        if (
-          newMessage.transferId &&
-          (newMessage.type === 'file_notice' || newMessage.type === 'file_request') &&
-          history.some((m) => m.transferId === newMessage.transferId && m.type === newMessage.type)
-        ) {
-          return prev;
-        }
         return { ...prev, [peerKey]: [...history, newMessage] };
       });
     },
@@ -801,6 +753,111 @@ function App(): React.ReactElement {
               }
               break;
             }
+            case ServerMessageType.FILE_SCAN_VERIFIED_CLEAN: {
+              const { fileInfo, uploadUrl, firebasePath } = message as FileScanVerifiedCleanMessage; // Type assertion
+              const chatKey = selectedUser || ALL_CHAT_KEY; // Determine context
+
+              // Attempt to find the original file in our pending state
+              const originalFile = pendingFileUploads.get(fileInfo.name);
+
+              if (uploadUrl && originalFile) { // Option B: Client needs to upload
+                addMessageToHistory(chatKey, { // Notify in the correct chat context
+                  type: 'file_notice',
+                  content: `Server verified ${fileInfo.name}. Uploading to storage...`,
+                  fileInfo: { name: fileInfo.name, size: originalFile.size, type: originalFile.type, firebasePath: firebasePath }
+                });
+
+                // Start the upload to Firebase Signed URL
+                try {
+                    // Use XMLHttpRequest for progress tracking, or simple fetch
+                    const xhr = new XMLHttpRequest();
+                    xhr.open('PUT', uploadUrl, true);
+                    xhr.setRequestHeader('Content-Type', originalFile.type || 'application/octet-stream');
+
+                    // Progress handling
+                    xhr.upload.onprogress = (event) => {
+                        if (event.lengthComputable) {
+                            const percentComplete = Math.round((event.loaded / event.total) * 100);
+                            setUploadProgressMap(prev => new Map(prev).set(firebasePath || fileInfo.name, percentComplete));
+                        }
+                    };
+
+                    xhr.onload = () => {
+                        if (xhr.status >= 200 && xhr.status < 300) {
+                            console.log(`Successfully uploaded ${fileInfo.name} to Firebase.`);
+                            addMessageToHistory(chatKey, {
+                                type: 'file_notice', // Or maybe a 'file_download_link' type later?
+                                content: `Successfully uploaded ${fileInfo.name}.`,
+                                fileInfo: { name: fileInfo.name, firebasePath: firebasePath }
+                            });
+                             // Clean up the stored file object and progress after successful upload
+                             setPendingFileUploads(prev => { const next = new Map(prev); next.delete(fileInfo.name); return next; });
+                             setUploadProgressMap(prev => { const next = new Map(prev); next.delete(firebasePath || fileInfo.name); return next; });
+
+                             // Optional: Notify server of successful upload?
+                             // sendData({ type: 'file_upload_complete_to_firebase', firebasePath: firebasePath });
+                        } else {
+                            throw new Error(`Storage upload failed: ${xhr.status} ${xhr.statusText}`);
+                        }
+                    };
+
+                    xhr.onerror = () => {
+                        throw new Error('Storage upload failed due to network error.');
+                    };
+
+                    xhr.send(originalFile);
+                    // Set initial progress state
+                    setUploadProgressMap(prev => new Map(prev).set(firebasePath || fileInfo.name, 0));
+
+
+                } catch (uploadError: any) {
+                    console.error(`[ERROR] Firebase upload failed for ${fileInfo.name}:`, uploadError);
+                    addMessageToHistory(chatKey, { type: 'error', content: `Storage upload failed: ${uploadError.message}` });
+                    // Clean up pending file state and progress on error too
+                    setPendingFileUploads(prev => { const next = new Map(prev); next.delete(fileInfo.name); return next; });
+                    setUploadProgressMap(prev => { const next = new Map(prev); next.delete(firebasePath || fileInfo.name); return next; });
+                }
+              } else if (!uploadUrl) {
+                 // Option A: Server handled upload, just notify user
+                 addMessageToHistory(chatKey, {
+                     type: 'file_notice',
+                     content: `${fileInfo.name} was verified and processed by the server.`,
+                     fileInfo: { name: fileInfo.name, firebasePath: firebasePath }
+                 });
+                  // Clean up pending file state even if server uploaded
+                  setPendingFileUploads(prev => { const next = new Map(prev); next.delete(fileInfo.name); return next; });
+              } else if (!originalFile) {
+                  // Error case: Server sent URL but client lost the file object
+                  console.error(`[ERROR] Could not find pending file object for ${fileInfo.name} to upload.`);
+                  addMessageToHistory(chatKey, { type: 'error', content: `Client error: Could not find '${fileInfo.name}' to complete upload.` });
+                   // Clean up progress map if needed
+                  setUploadProgressMap(prev => { const next = new Map(prev); next.delete(firebasePath || fileInfo.name); return next; });
+              }
+              break;
+            }
+            case ServerMessageType.FILE_SCAN_FAILED: {
+              const { fileInfo, reason } = message as FileScanFailedMessage; // Type assertion
+              const chatKey = selectedUser || ALL_CHAT_KEY; // Determine context
+
+              addMessageToHistory(chatKey, {
+                type: 'error',
+                content: `File processing failed for ${fileInfo.name}: ${reason}`,
+                fileInfo: { name: fileInfo.name } // Pass info for potential cleanup
+              });
+               // Clean up pending file state on failure
+               setPendingFileUploads(prev => {
+                   const next = new Map(prev);
+                   next.delete(fileInfo.name);
+                   return next;
+               });
+               // Clean up progress map too
+               setUploadProgressMap(prev => {
+                   const next = new Map(prev);
+                   next.delete(fileInfo.name);
+                   return next;
+               });
+              break;
+            }
             default:
               const unknownType = (message as any)?.type;
               console.warn(`[WS] Unhandled server message type: ${unknownType}`, message);
@@ -953,8 +1010,11 @@ function App(): React.ReactElement {
   const handleSendMessage = async (e?: React.FormEvent<HTMLFormElement>) => {
     e?.preventDefault();
     const ti = inputValue.trim();
-    if (ti && !selectedFile) await sendTextMessageContent(ti);
-    else if (selectedFile) handleSendFile();
+    if (ti && !selectedFile) {
+      if (typingTimeoutRef.current) clearTimeout(typingTimeoutRef.current);
+    } else if (selectedFile) {
+      handleSendFile();
+    }
   };
 
   // handleLogout
@@ -984,20 +1044,9 @@ function App(): React.ReactElement {
     setIsConnected(false);
     setSystemMessage('Logged out.');
     setLoginError('');
-    setIncomingFileRequests(new Map());
-    sendingFiles.current.clear();
-    receivingFiles.current.clear();
-    setTransferProgress({});
-    setChatHistories({ [ALL_CHAT_KEY]: [] }); // Reset history
-    setTypingUsers({}); // Reset typing indicators
-
-    if (ws.current) {
-      try {
-        if (reconnectTimeoutId.current) clearTimeout(reconnectTimeoutId.current);
-        ws.current.close(1000, 'User logged out');
-        ws.current = null;
-      } catch (e) {}
-    }
+    setPendingFileUploads(new Map());
+    setUploadProgressMap(new Map()); 
+    setSelectedFile(null);
   };
 
   const handleUsernameChange = (e: React.ChangeEvent<HTMLInputElement>) => {
@@ -1069,19 +1118,16 @@ function App(): React.ReactElement {
   const handleFileChange = async (event: React.ChangeEvent<HTMLInputElement>) => {
     const f = event.target.files?.[0];
     if (f) {
-      const scanResult = await scanFileForMalware(f);
-      if (!scanResult.isSafe) {
+      if (f.size > MAX_FILE_SIZE) {
         addMessageToHistory(currentChatKey, { type: 'error', content: `File rejected by scan: ${scanResult.message}` });
         setSelectedFile(null);
-        if (fileInputRef.current) fileInputRef.current.value = ''; // Clear input
-        return;
+      } else {
+        setSelectedFile(f); 
       }
-      setSelectedFile(f);
-      addMessageToHistory(currentChatKey, { type: 'system', content: `Selected file: ${f.name}. Ready to send request.`});
+      if (fileInputRef.current) fileInputRef.current.value = '';
     } else {
       setSelectedFile(null);
-    }
-    if (fileInputRef.current) fileInputRef.current.value = '';
+    } 
   };
   const handleSendFile = async () => {
     if (!selectedFile || !selectedUser || !isLoggedIn || !isConnected) {
@@ -1101,117 +1147,100 @@ function App(): React.ReactElement {
       sendData({ type: ClientMessageType.REQUEST_PUBLIC_KEY, username: selectedUser });
       return;
     }
-    const f = selectedFile;
-    const tid = generateUniqueId();
+    const file = selectedFile;
+    const recipient = selectedUser;
+    setPendingFileUploads(prev => new Map(prev).set(file.name, file));
     addMessageToHistory(selectedUser, {
       type: 'file_notice',
-      content: `Initiating transfer: ${f.name}`,
-      transferId: tid,
+      content: `Initiating transfer: ${file.name}`,
+      fileInfo: { name: file.name, size: file.size, type: file.type }
     });
     setSelectedFile(null);
     try {
-      const ak = await generateAesKey();
-      const akr = await exportAesKeyRaw(ak);
-      const ekb64 = await encryptRsaOaep(rpk, base64ToBuffer(akr));
-      const fb = await f.arrayBuffer();
-      const { iv: ivb64, ciphertext: ecb64 } = await encryptAesGcm(ak, fb);
-      const ecb = base64ToBuffer(ecb64);
-      const fi: FileInfo = {
-        name: f.name,
-        size: f.size,
-        type: f.type || 'application/octet-stream',
-        iv: ivb64,
-        encryptedKey: ekb64,
-      };
-      const ss: SendingFileState = {
-        file: f,
-        encryptedContent: ecb,
-        recipient: selectedUser,
-        fileInfo: fi,
-        status: 'pending_accept',
-      };
-      sendingFiles.current.set(tid, ss);
-      setTransferProgress((p) => ({ ...p, [tid]: 0 }));
-      sendData({
-        type: ClientMessageType.FILE_TRANSFER_REQUEST,
-        recipient: selectedUser,
-        fileInfo: fi,
-      });
-    } catch (e) {
-      console.error(`[ERROR] Failed initiate transfer ${tid}:`, e);
-      addMessageToHistory(selectedUser, {
-        type: 'error',
-        content: `Failed start transfer: ${e instanceof Error ? e.message : 'Unknown'}`,
-        transferId: tid,
-      });
-      sendingFiles.current.delete(tid);
-      setTransferProgress((p) => {
-        const n = { ...p };
-        delete n[tid];
-        return n;
-      });
-    }
-  };
-  const handleAcceptFile = async (transferId: string) => {
-    const r = incomingFileRequests.get(transferId);
-    if (!r) return;
-    if (!keyPairRef.current?.privateKey) {
-      addMessageToHistory(r.sender, {
-        type: 'error',
-        content: 'Cannot accept: Keys missing.',
-        transferId,
-      });
-      return;
-    }
-    const { sender, fileInfo } = r;
-    setIncomingFileRequests((p) => {
-      const n = new Map(p);
-      n.delete(transferId);
-      return n;
-    });
-    sendData({
-      type: ClientMessageType.FILE_TRANSFER_ACCEPT,
-      sender,
-      fileInfo: { name: fileInfo.name, size: fileInfo.size },
-    });
-    addMessageToHistory(sender, {
-      type: 'file_notice',
-      content: `Accepted file: ${fileInfo.name}. Receiving...`,
-      transferId,
-    });
-    console.log(`[WS] Sent FILE_TRANSFER_ACCEPT for transfer ${transferId}`);
-  };
+      // --- 1. Upload to Scanning Service ---
+      const SCANNER_API_UPLOAD_URL = 'YOUR_SCANNER_UPLOAD_ENDPOINT'; // !! REPLACE THIS !!
+      if (SCANNER_API_UPLOAD_URL === 'YOUR_SCANNER_UPLOAD_ENDPOINT') {
+           throw new Error("Scanner API Upload URL is not configured in the client code.");
+      }
 
-  const handleRejectFile = (transferId: string) => {
-    const r = incomingFileRequests.get(transferId);
-    if (!r) return;
-    const { sender, fileInfo } = r;
-    setIncomingFileRequests((p) => {
-      const n = new Map(p);
-      n.delete(transferId);
-      return n;
-    });
-    sendData({
-      type: ClientMessageType.FILE_TRANSFER_REJECT,
-      sender,
-      fileInfo: { name: fileInfo.name },
-    });
-    addMessageToHistory(sender, {
-      type: 'file_notice',
-      content: `Rejected file: ${fileInfo.name}`,
-      transferId,
-    });
+      const formData = new FormData();
+      formData.append('file', file); // Common field name, check your API docs
+
+      console.log(`[SCAN] Uploading ${file.name} to ${SCANNER_API_UPLOAD_URL}`);
+      const scanResponse = await fetch(SCANNER_API_UPLOAD_URL, {
+        method: 'POST',
+        body: formData,
+        // Add headers if required by the API (e.g., client-side API key - less secure)
+        // headers: { 'Authorization': 'Bearer YOUR_CLIENT_SIDE_KEY' }
+      });
+
+      if (!scanResponse.ok) {
+        const errorText = await scanResponse.text();
+        throw new Error(`Scanning service upload failed: ${scanResponse.status} ${errorText}`);
+      }
+
+      // IMPORTANT: Adjust parsing based on your API's response structure
+      const scanResult = await scanResponse.json(); // e.g., { scanId: 'xyz123', status: 'clean' or 'infected' or 'pending' }
+      console.log(`[SCAN] Scan service response for ${file.name}:`, scanResult);
+
+      // Handle potentially asynchronous scanning APIs if necessary
+      // if (scanResult.status === 'pending') { /* ... logic to poll or wait ... */ }
+
+      const scanId = scanResult.scanId;
+      // IMPORTANT: Adjust the condition based on your API's success/failure indicators
+      const isPotentiallyHarmful = scanResult.status !== 'clean'; // Example check
+
+      if (!scanId) {
+        throw new Error('Scanning service did not return a scan ID.');
+      }
+      if (isPotentiallyHarmful) {
+           throw new Error(`Scan service reported file as potentially unsafe: Status '${scanResult.status}'`);
+      }
+
+
+      // --- 2. Send Scan Completion to Your Server ---
+      addMessageToHistory(recipient, {
+        type: 'file_notice',
+        content: `Scan complete for ${file.name}. Notifying server for verification...`,
+        fileInfo: { name: file.name }
+      });
+
+      // Prepare basic file info for the server verification step
+      const fileInfoForServer = {
+        name: file.name,
+        size: file.size,
+        type: file.type || 'application/octet-stream',
+      };
+
+      sendData({
+        type: ClientMessageType.FILE_SCAN_COMPLETE, // Use the new enum value
+        scanId: scanId,
+        fileInfo: fileInfoForServer,
+        recipient: recipient, // Send recipient to server
+      });
+
+    } catch (error: any) {
+      console.error(`[ERROR] Failed file scan initiation for ${file.name}:`, error);
+      addMessageToHistory(recipient, {
+        type: 'error',
+        content: `Failed to initiate file scan for ${file.name}: ${error.message}`,
+      });
+       setPendingFileUploads(prev => {
+           const next = new Map(prev);
+           next.delete(file.name);
+           return next;
+       });
+    }
   };
-  const handleDownloadFile = (downloadUrl: string | undefined, filename: string | undefined) => {
-    if (!downloadUrl || !filename) {
+  const handleDownloadFile = (objectUrl: string | undefined, filename: string | undefined) => {
+    if (!objectUrl || !filename) {
       addMessageToHistory(currentChatKey, {type: 'error', content: 'Download URL or filename missing.'});
       return;
     }
     console.log(`Attempting to download ${filename} from ${downloadUrl}`);
     const a = document.createElement('a');
-    a.href = downloadUrl;
+    a.href = objectUrl;
     a.download = filename;
-    a.target = '_blank';
     document.body.appendChild(a);
     a.click();
     document.body.removeChild(a);
@@ -1245,7 +1274,7 @@ function App(): React.ReactElement {
       ), // Add users from history (excluding self and All Chat)
     ])
   );
-  const fileTransferReady = selectedUser ? peerPublicKeys.has(selectedUser) : false;
+  const fileTransferReady = !!selectedUser;
   // Get users currently typing in the active chat context
   const usersTypingInCurrentChat = Array.from(typingUsers[currentChatKey] || []);
 
@@ -1410,66 +1439,30 @@ function App(): React.ReactElement {
                       ? `${msg.timestamp}-${index}`
                       : `msg-${index}`;
                   // File Transfer Messages (Non-persisted)
-                  if (msg.type === 'file_request' && msg.transferId && msg.fileInfo) {
-                    const r = incomingFileRequests.get(msg.transferId);
-                    if (!r) return null;
+                  if (msg.type === 'file_notice' && msg.fileInfo) {
+                    const progressKey = msg.fileInfo.firebasePath || msg.fileInfo.name;
+                    const progress = uploadProgressMap.get(progressKey);
+                    const isUploading = progress !== undefined && progress >= 0 && progress < 100;
+                    const noticeText = typeof msg.content === 'string' ? msg.content : 'File Notice';
+
                     return (
                       <Alert
-                        key={messageKey}
-                        variant="default"
-                        className="bg-blue-50 border-blue-200"
-                      >
-                        <FileIcon className="h-4 w-4" />
-                        <AlertTitle className="font-semibold">
-                          Incoming File from {msg.sender}
-                        </AlertTitle>
-                        <AlertDescription className="text-sm">
-                          <p className="mb-2">
-                            User <span className="font-medium">{msg.sender}</span> wants to send you{' '}
-                            <span className="font-medium">{msg.fileInfo.name}</span> ({' '}
-                            {(msg.fileInfo.size / 1024 / 1024).toFixed(2)} MB).
-                          </p>
-                          <div className="flex gap-2 mt-2">
-                            <Button
-                              size="sm"
-                              variant="default"
-                              onClick={() => handleAcceptFile(msg.transferId!)}
-                            >
-                              <Check className="h-4 w-4 mr-1" /> Accept
-                            </Button>
-                            <Button
-                              size="sm"
-                              variant="destructive"
-                              onClick={() => handleRejectFile(msg.transferId!)}
-                            >
-                              <X className="h-4 w-4 mr-1" /> Reject
-                            </Button>
-                          </div>
-                        </AlertDescription>
-                      </Alert>
+                      key={messageKey}
+                      variant="default"
+                      className="bg-gray-50 border-gray-200 text-xs"
+                    >
+                      <FileIcon className="h-4 w-4" />
+                      <AlertDescription>
+                        {noticeText}
+                        {isUploading && (
+                          <Progress value={progress} className="w-full h-1.5 mt-1" />
+                        )}
+                        {/* Maybe add download link here if fileInfo.firebasePath exists and upload is complete? */}
+                      </AlertDescription>
+                    </Alert>
                     );
                   }
-                  if (msg.type === 'file_notice') {
-                    const p = transferProgress[msg.transferId!] ?? null;
-                    const iS = sendingFiles.current.has(msg.transferId!);
-                    const iR = receivingFiles.current.has(msg.transferId!);
-                    const st = typeof msg.content === 'string' ? msg.content : 'File Notice';
-                    return (
-                      <Alert
-                        key={messageKey}
-                        variant="default"
-                        className="bg-gray-50 border-gray-200 text-xs"
-                      >
-                        <FileIcon className="h-4 w-4" />
-                        <AlertDescription>
-                          {st}{' '}
-                          {(iS || iR) && p !== null && p >= 0 && p <= 100 && (
-                            <Progress value={p} className="w-full h-2 mt-1" />
-                          )}
-                        </AlertDescription>
-                      </Alert>
-                    );
-                  }
+                  
                   if (msg.type === 'file_image' && msg.objectUrl && msg.fileInfo) {
                     return (
                       <div
@@ -1572,6 +1565,29 @@ function App(): React.ReactElement {
                       );
                     }
                   }
+                  if (msg.type === 'file_download_link' && msg.fileInfo?.firebasePath) {
+                    // TODO: Implement requesting a signed download URL from server
+                    const handleRequestDownload = async (path: string, name: string) => {
+                        console.log("Requesting download URL for:", path);
+                         // Send message to server: { type: 'request_download_url', firebasePath: path }
+                         // Server responds with: { type: 'download_url_response', downloadUrl: '...', fileName: name }
+                         // Then trigger download: window.open(downloadUrl, '_blank'); or use fetch+blob
+                         addMessageToHistory(currentChatKey, {type: 'system', content: `Download for ${name} not implemented yet.`});
+                    };
+                    return (
+                         <Alert key={messageKey} variant="default" className="bg-green-50 border-green-200">
+                             <FileIcon className="h-4 w-4 text-green-700"/>
+                             <AlertTitle className="font-semibold">File Ready: {msg.fileInfo.name}</AlertTitle>
+                             <AlertDescription>
+                                 Sent by {msg.sender || 'Unknown'}.
+                                 <Button size="sm" variant="link" className="p-0 h-auto ml-2 text-green-700"
+                                     onClick={() => handleRequestDownload(msg.fileInfo!.firebasePath!, msg.fileInfo!.name!)}>
+                                     Download
+                                 </Button>
+                             </AlertDescription>
+                         </Alert>
+                    );
+                }
                   return null;
                 })}
                 <div ref={messagesEndRef} />

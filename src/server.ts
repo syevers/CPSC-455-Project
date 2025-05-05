@@ -6,6 +6,7 @@ import { getStorage } from 'firebase-admin/storage';
 import { existsSync, readFileSync } from 'fs';
 import type { IncomingMessage, ServerResponse } from 'http';
 import http from 'http';
+import https from 'https'
 import path from 'path';
 import { WebSocket, WebSocketServer, type RawData } from 'ws';
 
@@ -21,6 +22,7 @@ const RATE_LIMIT_BLOCK_DURATION = 10000;
 const HEARTBEAT_INTERVAL = 30000;
 const SALT_ROUNDS = 10;
 const MAX_FILE_SIZE = 10 * 1024 * 1024;
+const MAX_CHUNK_SIZE = 64 * 1024;
 const MAX_HISTORY_MESSAGES = 200;
 const ALL_CHAT_KEY = 'All Chat';
 const FIRESTORE_HISTORY_COLLECTION = 'chatlogs';
@@ -28,7 +30,6 @@ const FIRESTORE_USERS_COLLECTION = 'users';
 const STORAGE_BUCKET = process.env.FIREBASE_STORAGE_BUCKET;
 
 let firestore: admin.firestore.Firestore | null = null;
-let storage: admin.storage.Storage | null = null;
 let serviceAccount: any;
 
 try {
@@ -45,9 +46,8 @@ try {
     }
     admin.initializeApp({
       credential: admin.credential.cert(serviceAccount),
-      storageBucket: STORAGE_BUCKET,
+      storageBucket: process.env.FIREBASE_STORAGE_BUCKET,
     });
-    console.log('[SRV] Firebase Admin SDK initialized successfully.');
   } else {
     throw new Error(
       'Firebase credentials not configured. Set FIREBASE_SERVICE_ACCOUNT (with JSON content) environment variable on Render.'
@@ -55,16 +55,23 @@ try {
   }
 
   firestore = admin.firestore();
-  storage = getStorage();
   if (firestore) {
     console.log('[SRV-DB] Firestore instance obtained successfully.');
   } else {
     throw new Error('Failed to get Firestore instance from initialized app.');
   }
-  if (storage) {
-    console.log('[SRV-STORAGE] Firebase Storage instance obtained successfully.');
-  } else {
-    throw new Error('Failed to get Storage instance from initialized app.');
+  console.log('[SRV-DB] Firebase Admin SDK initialized successfully for Firestore.');
+  try {
+    const bucketName = process.env.FIREBASE_STORAGE_BUCKET;
+    if (bucketName) {
+      await admin.storage().bucket(bucketName).exists();
+      console.log(`[SRV-STORAGE] Successfully accessed Firebase Storage bucket: ${bucketName}`);
+    } else {
+      console.warn('[SRV-STORAGE] FIREBASE_STORAGE_BUCKET environment variable not set. Storage operations may fail.');
+    }
+  } catch (storageError: any) {
+    console.error(`[SRV-STORAGE] FATAL: Failed to access Firebase Storage bucket '${process.env.FIREBASE_STORAGE_BUCKET || ''}':`, storageError.message);
+    process.exit(1);
   }
   console.log('[SRV] Firebase Admin SDK initialized successfully for Firestore and Storage.');
 } catch (error: any) {
@@ -116,10 +123,8 @@ enum ServerMessageType {
   RECEIVE_PUBLIC_KEY = 'receive_public_key',
   PONG = 'pong',
   PING = 'ping',
-  INCOMING_FILE_REQUEST = 'incoming_file_request',
-  FILE_ACCEPT_NOTICE = 'file_accept_notice',
-  FILE_REJECT_NOTICE = 'file_reject_notice',
-  FILE_URL = 'file_url',
+  FILE_SCAN_VERIFIED_CLEAN = 'file_scan_verified_clean', // Server confirms clean scan
+  FILE_SCAN_FAILED = 'file_scan_failed',
   RECEIVE_HISTORY = 'receive_history',
   USER_TYPING = 'user_typing',
   USER_STOPPED_TYPING = 'user_stopped_typing',
@@ -132,10 +137,7 @@ enum ClientMessageType {
   REQUEST_PUBLIC_KEY = 'request_public_key',
   PING = 'ping',
   PONG = 'pong',
-  FILE_TRANSFER_REQUEST = 'file_transfer_request',
-  FILE_TRANSFER_ACCEPT = 'file_transfer_accept',
-  FILE_TRANSFER_REJECT = 'file_transfer_reject',
-  FILE_UPLOAD = 'file_upload',
+  FILE_SCAN_COMPLETE = 'file_scan_complete',
   REQUEST_HISTORY = 'request_history',
   START_TYPING = 'start_typing',
   STOP_TYPING = 'stop_typing',
@@ -231,54 +233,23 @@ interface UserStoppedTypingMessage extends BaseMessage {
   sender: string;
   recipient?: string;
 }
-interface FileInfo {
-  name: string;
-  size: number;
-  type: string;
-  iv: string;
-  encryptedKey: string;
+
+interface FileScanCompleteMessage extends BaseMessage {
+  type: ClientMessageType.FILE_SCAN_COMPLETE;
+  scanId: string; // ID from the scanning service
+  fileInfo: { name: string; size: number; type: string }; // Basic info needed by server
+  recipient: string; // Keep track of intended recipient
 }
-interface FileTransferRequestMessage extends BaseMessage {
-  type: ClientMessageType.FILE_TRANSFER_REQUEST;
-  recipient: string;
-  fileInfo: FileInfo;
+interface FileScanVerifiedCleanMessage extends BaseMessage {
+  type: ServerMessageType.FILE_SCAN_VERIFIED_CLEAN;
+  fileInfo: { name: string }; // Name to identify the file on client
+  uploadUrl?: string; // For Option B (Client Upload) - Signed URL from Firebase
+  firebasePath?: string; // For Option A/B - Path where server stored/expects it
 }
-interface FileTransferAcceptMessage extends BaseMessage {
-  type: ClientMessageType.FILE_TRANSFER_ACCEPT;
-  sender: string;
-  fileInfo: { name: string; size: number };
-}
-interface FileTransferRejectMessage extends BaseMessage {
-  type: ClientMessageType.FILE_TRANSFER_REJECT;
-  sender: string;
-  fileInfo: { name: string };
-}
-interface FileUploadMessage extends BaseMessage {
-  type: ClientMessageType.FILE_UPLOAD;
-  recipient: string;
-  fileInfo: FileInfo;
-  fileData: string;
-}
-interface IncomingFileRequestMessage extends BaseMessage {
-  type: ServerMessageType.INCOMING_FILE_REQUEST;
-  sender: string;
-  fileInfo: FileInfo;
-}
-interface FileAcceptNoticeMessage extends BaseMessage {
-  type: ServerMessageType.FILE_ACCEPT_NOTICE;
-  recipient: string;
-  fileInfo: { name: string; size: number };
-}
-interface FileRejectNoticeMessage extends BaseMessage {
-  type: ServerMessageType.FILE_REJECT_NOTICE;
-  recipient: string;
-  fileInfo: { name: string };
-}
-interface FileUrlMessage extends BaseMessage {
-  type: ServerMessageType.FILE_URL;
-  sender: string;
-  fileInfo: { name: string; size: number; type: string };
-  downloadUrl: string;
+interface FileScanFailedMessage extends BaseMessage {
+  type: ServerMessageType.FILE_SCAN_FAILED;
+  fileInfo: { name: string }; // Name to identify the file on client
+  reason: string; // Reason for failure (scanner result or server error)
 }
 
 function isLoginMessage(msg: any): msg is LoginMessage {
@@ -305,44 +276,6 @@ function isClientSendMessage(msg: any): msg is ClientSendMessage {
     (msg.recipient === undefined || msg.recipient === null || typeof msg.recipient === 'string')
   );
 }
-function isFileTransferRequest(msg: any): msg is FileTransferRequestMessage {
-  return (
-    msg?.type === ClientMessageType.FILE_TRANSFER_REQUEST &&
-    typeof msg.recipient === 'string' &&
-    typeof msg.fileInfo?.name === 'string' &&
-    typeof msg.fileInfo?.size === 'number' &&
-    typeof msg.fileInfo?.type === 'string' &&
-    typeof msg.fileInfo?.iv === 'string' &&
-    typeof msg.fileInfo?.encryptedKey === 'string'
-  );
-}
-function isFileTransferAccept(msg: any): msg is FileTransferAcceptMessage {
-  return (
-    msg?.type === ClientMessageType.FILE_TRANSFER_ACCEPT &&
-    typeof msg.sender === 'string' &&
-    typeof msg.fileInfo?.name === 'string' &&
-    typeof msg.fileInfo?.size === 'number'
-  );
-}
-function isFileTransferReject(msg: any): msg is FileTransferRejectMessage {
-  return (
-    msg?.type === ClientMessageType.FILE_TRANSFER_REJECT &&
-    typeof msg.sender === 'string' &&
-    typeof msg.fileInfo?.name === 'string'
-  );
-}
-function isFileUpload(msg: any): msg is FileUploadMessage {
-  return (
-    msg?.type === ClientMessageType.FILE_UPLOAD &&
-    typeof msg.recipient === 'string' &&
-    typeof msg.fileInfo?.name === 'string' &&
-    typeof msg.fileInfo?.size === 'number' &&
-    typeof msg.fileInfo?.type === 'string' &&
-    typeof msg.fileInfo?.iv === 'string' &&
-    typeof msg.fileInfo?.encryptedKey === 'string' &&
-    typeof msg.fileData === 'string'
-  );
-}
 function isRequestHistoryMessage(msg: any): msg is RequestHistoryMessage {
   return msg?.type === ClientMessageType.REQUEST_HISTORY;
 }
@@ -358,7 +291,14 @@ function isStopTypingMessage(msg: any): msg is StopTypingMessage {
     (msg.recipient === undefined || msg.recipient === null || typeof msg.recipient === 'string')
   );
 }
-
+function isFileScanCompleteMessage(msg: any): msg is FileScanCompleteMessage {
+  return msg?.type === ClientMessageType.FILE_SCAN_COMPLETE &&
+         typeof msg.scanId === 'string' &&
+         typeof msg.fileInfo?.name === 'string' &&
+         typeof msg.fileInfo?.size === 'number' &&
+         typeof msg.fileInfo?.type === 'string' &&
+         typeof msg.recipient === 'string';
+}
 function decryptWithServerKey(encryptedDataB64: string): Buffer | null {
   if (!serverPrivateKey) {
     console.error('[CRYPTO] Server private key not loaded.');
@@ -1191,159 +1131,141 @@ wss.on('connection', (ws: WebSocket, req: IncomingMessage) => {
       }
       return;
     }
+    if (isFileScanCompleteMessage(parsedData)) {
+      const { scanId, fileInfo, recipient } = parsedData;
+      console.log(`[SRV] Scan complete report from ${currentUsername} for ${recipient}'s file: ${fileInfo.name} (ScanID: ${scanId})`);
 
-    if (isFileTransferRequest(parsedData)) {
-      const { recipient, fileInfo } = parsedData;
-      console.log(`[SRV] Received file transfer request from ${currentUsername} to ${recipient}`);
+      // Basic size check again on server side (using info from client)
       if (fileInfo.size > MAX_FILE_SIZE) {
-        console.warn(`[SRV] File transfer rejected: File too large (${fileInfo.size} bytes).`);
-        sendToClient(ws, {
-          type: ServerMessageType.SYSTEM,
-          content: `File rejected: Exceeds size limit of ${MAX_FILE_SIZE / 1024 / 1024}MB.`,
-        });
-        return;
-      }
-      const rws = clientsByName.get(recipient);
-      if (rws && rws.readyState === WebSocket.OPEN) {
-        const mts: IncomingFileRequestMessage = {
-          type: ServerMessageType.INCOMING_FILE_REQUEST,
-          sender: currentUsername,
-          fileInfo: fileInfo,
+        console.warn(`[SRV] File scan report rejected: File size (${fileInfo.size}) exceeds limit.`);
+        const failMsg: FileScanFailedMessage = {
+          type: ServerMessageType.FILE_SCAN_FAILED,
+          fileInfo: { name: fileInfo.name },
+          reason: `Reported file size exceeds server limit (${MAX_FILE_SIZE / 1024 / 1024}MB).`,
         };
-        console.log(`   -> Relaying request to ${recipient}`);
-        sendToClient(rws, mts);
-      } else {
-        console.log(`[SRV] File transfer request failed: Recipient '${recipient}' offline.`);
-        sendToClient(ws, {
-          type: ServerMessageType.SYSTEM,
-          content: `[SRV]: User '${recipient}' is offline. Cannot initiate file transfer.`,
-        });
-      }
-      return;
-    }
-    if (isFileTransferAccept(parsedData)) {
-      const { sender: os, fileInfo } = parsedData;
-      console.log(
-        `[SRV] Received file transfer acceptance from ${currentUsername} for ${os}'s file: ${fileInfo.name}`
-      );
-      const osws = clientsByName.get(os);
-      if (osws && osws.readyState === WebSocket.OPEN) {
-        const mts: FileAcceptNoticeMessage = {
-          type: ServerMessageType.FILE_ACCEPT_NOTICE,
-          recipient: currentUsername,
-          fileInfo: fileInfo,
-        };
-        console.log(`   -> Notifying original sender ${os}`);
-        sendToClient(osws, mts);
-      } else {
-        console.log(`[SRV] File acceptance notice failed: Original sender '${os}' offline.`);
-        sendToClient(ws, {
-          type: ServerMessageType.SYSTEM,
-          content: `[SRV]: User '${os}' went offline. File transfer cancelled.`,
-        });
-      }
-      return;
-    }
-    if (isFileTransferReject(parsedData)) {
-      const { sender: os, fileInfo } = parsedData;
-      console.log(
-        `[SRV] Received file transfer rejection from ${currentUsername} for ${os}'s file: ${fileInfo.name}`
-      );
-      const osws = clientsByName.get(os);
-      if (osws && osws.readyState === WebSocket.OPEN) {
-        const mts: FileRejectNoticeMessage = {
-          type: ServerMessageType.FILE_REJECT_NOTICE,
-          recipient: currentUsername,
-          fileInfo: fileInfo,
-        };
-        console.log(`   -> Notifying original sender ${os}`);
-        sendToClient(osws, mts);
-      } else {
-        console.log(`[SRV] File rejection notice failed: Original sender '${os}' offline.`);
-      }
-      return;
-    }
-    if (isFileUpload(parsedData)) {
-      const { recipient, fileInfo, fileData } = parsedData;
-      console.log(`[SRV] Received file upload from ${currentUsername} for ${recipient}`);
-      const rws = clientsByName.get(recipient);
-      if (!rws || rws.readyState !== WebSocket.OPEN) {
-        console.log(`[SRV] File upload failed: Recipient '${recipient}' offline.`);
-        sendToClient(ws, {
-          type: ServerMessageType.SYSTEM,
-          content: `[SRV]: User '${recipient}' is offline. File transfer failed.`,
-        });
-        return;
-      }
-      if (!storage) {
-        console.error('[SRV-STORAGE] Storage not initialized. Cannot upload file.');
-        sendToClient(ws, {
-          type: ServerMessageType.SYSTEM,
-          content: '[SRV Error] Storage service unavailable.',
-        });
+        sendToClient(ws, failMsg); // Notify sender
         return;
       }
 
-      if (fileInfo.size > MAX_FILE_SIZE) {
-        console.warn(`[SRV] File upload rejected by server: File too large (${fileInfo.size} bytes).`);
-        sendToClient(ws, {
-          type: ServerMessageType.SYSTEM,
-          content: `File rejected by server: Exceeds size limit of ${MAX_FILE_SIZE / 1024 / 1024}MB.`,
-        });
-        return;
-      }
       try {
-        const fileBuffer = Buffer.from(fileData, 'base64');
-        const bucket = storage.bucket();
-        const destinationPath = `chat_files/${Date.now()}_${fileInfo.name}`;
-        const file = bucket.file(destinationPath);
-        await file.save(fileBuffer, {
-          contentType: fileInfo.type,
-          metadata: {
-            // Custom metadata needs to be nested under 'metadata' key
-            metadata: {
+        // --- Verification Step ---
+        const SCANNER_API_KEY = process.env.SCANNER_API_KEY;
+        const SCANNER_VERIFY_URL_TEMPLATE = process.env.SCANNER_VERIFY_URL_TEMPLATE; // e.g., https://api.scancorp.com/verify/{SCAN_ID}
+
+        if (!SCANNER_API_KEY || !SCANNER_VERIFY_URL_TEMPLATE) {
+          throw new Error('Scanner service API Key or Verify URL not configured on server.');
+        }
+
+        const verificationUrl = SCANNER_VERIFY_URL_TEMPLATE.replace('{SCAN_ID}', scanId);
+        console.log(`[SRV] Verifying scan ${scanId} at ${verificationUrl}`);
+
+        // --- Make API Call to Scanner Verification Endpoint ---
+        // Using built-in https module example:
+        const verificationResult = await new Promise<{ status: string; [key: string]: any }>((resolve, reject) => {
+          // Adjust URL parsing and options based on your SCANNER_VERIFY_URL_TEMPLATE
+          const url = new URL(verificationUrl);
+          const options = {
+            hostname: url.hostname,
+            path: url.pathname + url.search,
+            method: 'GET', // Or 'POST', adjust as needed
+            headers: {
+              'Authorization': `Bearer ${SCANNER_API_KEY}`, // Adjust auth method if needed
+              'Accept': 'application/json',
+            }
+          };
+
+          const req = https.request(options, (res) => {
+            let data = '';
+            res.on('data', (chunk) => { data += chunk; });
+            res.on('end', () => {
+              if (res.statusCode && res.statusCode >= 200 && res.statusCode < 300) {
+                try {
+                  console.log(`[SRV] Verification API response for ${scanId}: ${data}`);
+                  resolve(JSON.parse(data));
+                } catch (e) {
+                  reject(new Error('Failed to parse scanner verification response JSON.'));
+                }
+              } else {
+                console.error(`[SRV] Verification API Error Status: ${res.statusCode}, Body: ${data}`);
+                reject(new Error(`Scan verification API failed: Status ${res.statusCode}`));
+              }
+            });
+          });
+          req.on('error', (e) => { reject(new Error(`Scan verification request error: ${e.message}`)); });
+          req.end(); // End the request
+        });
+
+
+        // --- Process Verification Result ---
+        // IMPORTANT: Adjust 'cleanStatusString' based on your API's actual success response
+        const cleanStatusString = 'clean'; // Or 'no_threats_found', 'ok', etc.
+        if (verificationResult.status && verificationResult.status.toLowerCase() === cleanStatusString) {
+          console.log(`[SRV] Scan verified CLEAN for ${fileInfo.name} (ScanID: ${scanId})`);
+
+          // --- Firebase Upload Step (Using Option B: Client Upload via Signed URL) ---
+          const bucketName = process.env.FIREBASE_STORAGE_BUCKET;
+          if (!bucketName) throw new Error('Firebase Storage bucket name not configured.');
+
+          const bucket = admin.storage().bucket(bucketName);
+          // Construct a unique path: /user_uploads/{recipientUsername}/{senderUsername}/{timestamp}-{originalFilename}
+          const firebasePath = `user_uploads/${recipient}/${currentUsername}/${Date.now()}-${fileInfo.name}`;
+          const fileRef = bucket.file(firebasePath);
+
+          const signedUrlOptions = {
+            version: 'v4' as const,
+            action: 'write' as const,
+            expires: Date.now() + 15 * 60 * 1000, // 15 minutes expiry
+            contentType: fileInfo.type || 'application/octet-stream', // Get type from client's report
+          };
+
+          // Generate the signed URL
+          const [uploadUrl] = await fileRef.getSignedUrl(signedUrlOptions);
+          console.log(`[SRV] Generated Firebase signed URL for ${fileInfo.name}`);
+
+          // --- Notify Sender Client ---
+          const cleanMsg: FileScanVerifiedCleanMessage = {
+            type: ServerMessageType.FILE_SCAN_VERIFIED_CLEAN,
+            fileInfo: { name: fileInfo.name }, // Send name back for client matching
+            uploadUrl: uploadUrl, // Provide URL for client upload
+            firebasePath: firebasePath, // Send path for reference
+          };
+          sendToClient(ws, cleanMsg); // ws is the sender's WebSocket
+
+          // --- Notify Recipient Client (Optional) ---
+          const recipientWs = clientsByName.get(recipient);
+          if (recipientWs) {
+            // Send a different message - no uploadUrl needed for recipient
+            sendToClient(recipientWs, {
+              type: ServerMessageType.SYSTEM, // Or a new type like 'file_ready_notice'
+              content: `File ready: '${fileInfo.name}' from ${currentUsername} has been scanned and uploaded.`,
+              fileName: fileInfo.name,
+              firebasePath: firebasePath, // Recipient needs this to potentially download later
               sender: currentUsername,
-              recipient: recipient,
-              ncrypted: 'true',
-              originalName: fileInfo.name,
-              iv: fileInfo.iv,
-              encryptedKey: fileInfo.encryptedKey // Store encrypted key needed for decryption
-            },
-          },
-        });
-        console.log(`[SRV] File uploaded to Firebase Storage: ${destinationPath}`);
-        const [downloadUrl] = await file.getSignedUrl({
-          action: 'read',
-          expires: Date.now() + 1000 * 60 * 60 * 24 * 7, // Link expires in 7 days
-        });
+            });
+          }
 
-        console.log(`[SRV] Generated download URL for ${fileInfo.name}`);
+        } else {
+          const reportedStatus = verificationResult.status || 'unknown error';
+          console.warn(`[SRV] Scan verified INFECTED/Error for ${fileInfo.name} (ScanID: ${scanId}): Status: ${reportedStatus}`);
+          const failMsg: FileScanFailedMessage = {
+            type: ServerMessageType.FILE_SCAN_FAILED,
+            fileInfo: { name: fileInfo.name },
+            reason: `File scan result: ${reportedStatus}`,
+          };
+          sendToClient(ws, failMsg); // Notify sender
+        }
 
-        const mts: FileUrlMessage = {
-          type: ServerMessageType.FILE_URL,
-          sender: currentUsername,
-          fileInfo: {
-            name: fileInfo.name,
-            size: fileInfo.size,
-            type: fileInfo.type,
-          },
-          downloadUrl: downloadUrl,
+      } catch (error: any) {
+        console.error(`[SRV] Error during scan verification/Firebase init for ${fileInfo.name} (ScanID: ${scanId}):`, error);
+        const failMsg: FileScanFailedMessage = {
+          type: ServerMessageType.FILE_SCAN_FAILED,
+          fileInfo: { name: fileInfo.name },
+          reason: `Server error during verification: ${error.message}`,
         };
-        sendToClient(rws, mts);
-        sendToClient(ws, {
-          type: ServerMessageType.SYSTEM,
-          content: `File ${fileInfo.name} successfully uploaded and shared with ${recipient}.`,
-        });
-      } catch (e) {
-        console.error('[SRV] Failed to upload file to Firebase Storage:', e);
-        sendToClient(ws, {
-          type: ServerMessageType.SYSTEM,
-          content: `[SRV Error] Failed to upload file: ${e instanceof Error ? e.message : 'Unknown'}.`,
-        });
+        sendToClient(ws, failMsg); // Notify sender
       }
-      return;
+      return; // Important: End processing for this message
     }
-
     console.warn(
       `[SRV] Unhandled message type: '${(parsedData as any).type}' from: ${currentUsername}`
     );
