@@ -29,7 +29,6 @@ import {
   Smile,
   Trash2,
   Unlock,
-  Upload,
   User,
   Users,
   X,
@@ -165,9 +164,7 @@ const decryptRsaOaep = async (privateKey: CryptoKey, base64Data: string): Promis
 const scanFileForMalware = async (file: File): Promise<{ isSafe: boolean; message: string }> => {
   // Check file size
   if (file.size > MAX_FILE_SIZE) {
-    return { isSafe: false, message: `
-
-File size exceeds maximum limit of ${MAX_FILE_SIZE / 1024 / 1024}MB.` };
+    return { isSafe: false, message: `File size exceeds maximum limit of ${MAX_FILE_SIZE / 1024 / 1024}MB.` };
   }
 
   // Check file extension
@@ -552,326 +549,281 @@ function App(): React.ReactElement {
         console.error('[WS] WebSocket Error:', event);
         isConnecting.current = false;
       };
-    };
+      currentRunWs.onmessage = async (event: MessageEvent) => {
+        if (ws.current !== localWsInstance || !isEffectMounted) return;
+        try {
+          const message = JSON.parse(event.data as string) as ServerMessage;
 
-    const handleServerMessage = async (event: MessageEvent) => {
-      if (ws.current !== localWsInstance || !isEffectMounted) return;
-      try {
-        const message = JSON.parse(event.data as string) as ServerMessage;
-        switch (message.type) {
-        case ServerMessageType.SYSTEM: {
-          const content = message.content ?? '';
-          if (content === 'Login successful!') {
-            const loggedInUsername = usernameRef.current;
-            if (!loggedInUsername) {
-              console.error('CRITICAL: usernameRef is empty!');
-              setLoginError('Login failed: Internal error.');
-              setIsLoggedIn(false);
-              setCurrentUsername('');
+          switch (message.type) {
+            case ServerMessageType.SYSTEM: {
+              const content = message.content ?? '';
+              if (content === 'Login successful!') {
+                const loggedInUsername = usernameRef.current;
+                if (!loggedInUsername) {
+                  console.error('CRITICAL: usernameRef is empty!');
+                  setLoginError('Login failed: Internal error.');
+                  setIsLoggedIn(false);
+                  setCurrentUsername('');
+                  break;
+                }
+                setCurrentUsername(loggedInUsername);
+                setIsLoggedIn(true);
+                setLoginError('');
+                setSystemMessage('');
+                setUsername('');
+                setPassword('');
+                addMessageToHistory(ALL_CHAT_KEY, {
+                  type: 'system',
+                  content: `[SERVER]: ${content}`,
+                });
+                hasSharedKey.current = false;
+                console.log('[WS] Login successful, requesting history...');
+                setIsHistoryLoading(true);
+                sendData({ type: ClientMessageType.REQUEST_HISTORY });
+              } else if (content.startsWith('Login failed')) {
+                setLoginError(content);
+                setSystemMessage('');
+                setIsLoggedIn(false);
+                setCurrentUsername('');
+                usernameRef.current = '';
+              } else {
+                if (!content.startsWith('Public key for user')) {
+                  addMessageToHistory(ALL_CHAT_KEY, {
+                    type: 'system',
+                    content: `[SERVER]: ${content}`,
+                  });
+                } else {
+                  const match = content.match(/Public key for user '([^']*)'/);
+                  if (match && match[1]) {
+                    const peerUser = match[1];
+                    addMessageToHistory(peerUser, {
+                      type: 'system',
+                      content: `[SERVER]: ${content}`,
+                    });
+                  } else {
+                    addMessageToHistory(ALL_CHAT_KEY, {
+                      type: 'system',
+                      content: `[SERVER]: ${content}`,
+                    });
+                  }
+                }
+              }
               break;
             }
-            setCurrentUsername(loggedInUsername);
-            setIsLoggedIn(true);
-            setLoginError('');
-            setSystemMessage('');
-            setUsername('');
-            setPassword('');
-            addMessageToHistory(ALL_CHAT_KEY, {
-              type: 'system',
-              content: `[SERVER]: ${content}`,
-            });
-            hasSharedKey.current = false;
-            console.log('[WS] Login successful, requesting history...');
-            setIsHistoryLoading(true);
-            sendData({ type: ClientMessageType.REQUEST_HISTORY });
-          } else if (content.startsWith('Login failed')) {
-            setLoginError(content);
-            setSystemMessage('');
-            setIsLoggedIn(false);
-            setCurrentUsername('');
-            usernameRef.current = '';
-          } else {
-            if (!content.startsWith('Public key for user')) {
-              addMessageToHistory(ALL_CHAT_KEY, {
-                type: 'system',
-                content: `[SERVER]: ${content}`,
-              });
-          }
-          break;
-        }
-        case ServerMessageType.RECEIVE_HISTORY: {
-          console.log('[WS] Received history from server.');
-          setIsHistoryLoading(false);
-          if (message.history && typeof message.history === 'object') {
-            setChatHistories(message.history as ChatHistories);
-            console.log('[WS] History applied to state.');
-          } else {
-            console.error('[WS] Invalid history data received:', message.history);
-            addMessageToHistory(ALL_CHAT_KEY, {
-              type: 'error',
-              content: '[Error] Failed to load chat history.',
-            });
-          }
-          break;
-        }
-        case ServerMessageType.USER_TYPING: {
-          const { sender, recipient } = message;
-          const peerKey = recipient
-            ? sender === currentUsername
-              ? recipient
-              : sender
-            : ALL_CHAT_KEY;
-          setTypingUsers((prev) => {
-            const uc = new Set(prev[peerKey] || []);
-            uc.add(sender);
-            return { ...prev, [peerKey]: uc };
-          });
-          break;
-        }
-        case ServerMessageType.USER_STOPPED_TYPING: {
-          const { sender, recipient } = message;
-          const peerKey = recipient
-            ? sender === currentUsername
-              ? recipient
-              : sender
-            : ALL_CHAT_KEY;
-          setTypingUsers((prev) => {
-            const uc = new Set(prev[peerKey] || []);
-            uc.delete(sender);
-            if (uc.size === 0) {
-              const ns = { ...prev };
-              delete ns[peerKey];
-              return ns;
+            case ServerMessageType.RECEIVE_HISTORY: {
+              console.log('[WS] Received history from server.');
+              setIsHistoryLoading(false);
+              if (message.history && typeof message.history === 'object') {
+                const processedHistory: ChatHistories = {};
+                Object.entries(message.history).forEach(([peerKey, messages]) => {
+                  processedHistory[peerKey] = messages.map((msg) => {
+                    if ((msg.type === 'chat' || msg.type === 'my_chat') && typeof msg.content === 'string') {
+                      const urlMatch = msg.content.match(/(https?:\/\/\S+)/);
+                      const nameMatch = msg.content.match(/Here is the file: (.*)\n/);
+                      if (urlMatch && nameMatch) {
+                        return {
+                          ...msg,
+                          isFirebaseFile: true,
+                          fileInfo: { name: nameMatch[1].trim(), url: urlMatch[1] },
+                        };
+                      }
+                    }
+                    return msg;
+                  });
+                });
+                setChatHistories(processedHistory);
+                console.log('[WS] History applied to state.');
+              } else {
+                console.error('[WS] Invalid history data received:', message.history);
+                addMessageToHistory(ALL_CHAT_KEY, {
+                  type: 'error',
+                  content: '[Error] Failed to load chat history.',
+                });
+              }
+              break;
             }
-            return { ...prev, [peerKey]: uc };
-          });
-          break;
-        }
-        case ServerMessageType.USER_LIST: {
-          const nu = message.users ?? [];
-          const lu = usernameRef.current;
-          // Update the online users list state
-          setUsers(nu);
-          // Check if the currently selected user went offline
-          if (selectedUser && !nu.includes(selectedUser)) {
-            addMessageToHistory(selectedUser, {
-              type: 'system',
-              content: `User ${selectedUser} went offline.`,
-            });
-            // Don't deselect the user, just update their status indicator in the sidebar
-            // setSelectedUser(null); // Keep the conversation selected
-          }
-          // Update peer public keys (request missing keys for newly online users)
-          setPeerPublicKeys((pk) => {
-            const uk = new Map(pk);
-            let c = false;
-            // Remove keys for users who are no longer online (optional, could keep keys)
-            // Array.from(uk.keys()).forEach((u) => { if (!nu.includes(u)) { uk.delete(u); c = true; } });
-            if (lu) {
-              nu.forEach((u) => {
-                if (u !== lu && !uk.has(u)) {
-                  // Request key only if not already present
-                  console.log(`[WS] Requesting public key for newly online user: ${u}`);
-                  sendData({ type: ClientMessageType.REQUEST_PUBLIC_KEY, username: u });
+            case ServerMessageType.USER_TYPING: {
+              const { sender, recipient } = message;
+              const peerKey = recipient
+                ? sender === currentUsername
+                  ? recipient
+                  : sender
+                : ALL_CHAT_KEY;
+              setTypingUsers((prev) => {
+                const uc = new Set(prev[peerKey] || []);
+                uc.add(sender);
+                return { ...prev, [peerKey]: uc };
+              });
+              break;
+            }
+            case ServerMessageType.USER_STOPPED_TYPING: {
+              const { sender, recipient } = message;
+              const peerKey = recipient
+                ? sender === currentUsername
+                  ? recipient
+                  : sender
+                : ALL_CHAT_KEY;
+              setTypingUsers((prev) => {
+                const uc = new Set(prev[peerKey] || []);
+                uc.delete(sender);
+                if (uc.size === 0) {
+                  const ns = { ...prev };
+                  delete ns[peerKey];
+                  return ns;
                 }
+                return { ...prev, [peerKey]: uc };
               });
+              break;
             }
-            return c ? uk : pk; // Return existing map if no keys were removed
-          });
-          break;
-        }
-        case ServerMessageType.SERVER_PUBLIC_KEY: {
-          try {
-            const ik = await importPublicKeyPem(message.publicKey);
-            setServerPublicKey(ik);
-          } catch (e) {
-            console.error('[ERROR] Failed to import server public key:', e);
-            setLoginError('Error processing server key.');
-            if (ws.current) ws.current.close();
-          }
-          break;
-        }
-        case ServerMessageType.RECEIVE_PUBLIC_KEY: {
-          try {
-            const ik = await importUserPublicKey(message.publicKey);
-            setPeerPublicKeys((p) => new Map(p).set(message.username, ik));
-            if (selectedUser === message.username)
-              addMessageToHistory(selectedUser, {
-                type: 'system',
-                content: `Encryption key received for ${selectedUser}.`,
-              });
-          } catch (ie) {
-            console.error(`Failed to import public key for ${message.username}:`, ie);
-            addMessageToHistory(message.username, {
-              type: 'error',
-              content: `Invalid key from ${message.username}.`,
-            });
-          }
-          break;
-        }
-        case ServerMessageType.RECEIVE_MESSAGE: {
-          const { sender, isBroadcast, payload } = message;
-          const { iv, encryptedKey, ciphertext } = payload;
-          const mpk = keyPairRef.current?.privateKey;
-          if (!mpk) {
-            addMessageToHistory(isBroadcast ? ALL_CHAT_KEY : sender, {
-              type: 'error',
-              content: '[Error] Cannot decrypt: Missing private key.',
-            });
-            break;
-          }
-          try {
-            const akb = await decryptRsaOaep(mpk, encryptedKey);
-            const ak = await importAesKeyRaw(bufferToBase64(akb));
-            const dc = await decryptAesGcm(ak, iv, ciphertext);
-            const dt = new TextDecoder().decode(dc);
-            addMessageToHistory(isBroadcast ? ALL_CHAT_KEY : sender, {
-              type: 'chat',
-              content: dt,
-              sender: sender,
-              isEncrypted: true,
-            });
-          } catch (de) {
-            console.error(`Failed to decrypt message from ${sender}:`, de);
-            addMessageToHistory(isBroadcast ? ALL_CHAT_KEY : sender, {
-              type: 'error',
-              content: `[Decryption Failed from ${sender}]`,
-              sender: sender,
-            });
-          }
-          break;
-        }
-        case ServerMessageType.PING: {
-          try {
-            sendData({ type: ClientMessageType.PONG });
-          } catch (e) {
-            console.error('[ERROR] Failed to send PONG:', e);
-          }
-          break;
-        }
-        case ServerMessageType.INCOMING_FILE_REQUEST: {
-          const { sender, fileInfo } = message;
-          const tid = generateUniqueId();
-          const req: FileTransferRequest = { id: tid, sender, fileInfo, timestamp: Date.now() };
-          setIncomingFileRequests((p) => new Map(p).set(tid, req));
-          addMessageToHistory(sender, {
-            type: 'file_request',
-            sender,
-            content: `Wants to send you a file:`,
-            fileInfo,
-            transferId: tid,
-          });
-          break;
-        }
-        case ServerMessageType.FILE_ACCEPT_NOTICE: {
-          const { recipient, fileInfo } = message;
-          let transferId: string | null = null;
-          let sendingState: SendingFileState | null = null;
+            case ServerMessageType.USER_LIST: {
+              const nu = message.users ?? [];
+              const lu = usernameRef.current;
+              setUsers(nu);
 
-          sendingFiles.current.forEach((state, id) => {
-            if (
-              s.recipient === recipient &&
-                  s.fileInfo.name === fileInfo.name &&
-                  s.status === 'pending_accept'
-            ) {
-              transferId = id;
-              sendingState = state;
+              if (selectedUser && !nu.includes(selectedUser)) {
+                addMessageToHistory(selectedUser, {
+                  type: 'system',
+                  content: `User ${selectedUser} went offline.`,
+                });
+              }
+
+              setPeerPublicKeys((pk) => {
+                const uk = new Map(pk);
+                if (lu) {
+                  nu.forEach((u) => {
+                    if (u !== lu && !uk.has(u)) {
+                      console.log(`[WS] Requesting public key for newly online user: ${u}`);
+                      sendData({ type: ClientMessageType.REQUEST_PUBLIC_KEY, username: u });
+                    }
+                  });
+                }
+                return uk;
+              });
+              break;
             }
-          });
-
-          if (transferId && sendingState) {
-            console.log(`[WS] Received acceptance for transfer ${transferId}. Preparing upload...`);
-            sendingState.status = 'uploading'; // Update status
-            setTransferProgress((p) => ({ ...p, [transferId!]: 'Uploading...' })); // Show "Uploading..."
-
-            addMessageToHistory(recipient, {
-              type: 'file_notice',
-              content: `User accepted file: ${fileInfo.name}. Uploading...`,
-              transferId: transferId,
-            });
-
-            try {
-              // Read the file content as ArrayBuffer
-              const fileBuffer = await sendingState.file.arrayBuffer();
-              // Encode the buffer to base64
-              const fileData = bufferToBase64(fileBuffer);
-
-              // Send the FILE_UPLOAD message with all data
-              sendData({
-                type: ClientMessageType.FILE_UPLOAD,
-                recipient: sendingState.recipient,
-                fileInfo: sendingState.fileInfo, // Send the original FileInfo (contains keys/iv)
-                fileData: fileData, // Send the base64 encoded file content
-              });
-
-              console.log(`[WS] Sent FILE_UPLOAD message for transfer ${transferId}`);
-
-            } catch (error) {
-              console.error(`[Error] Failed to read or encode file for transfer ${transferId}:`, error);
-              sendingState.status = 'error';
-              addMessageToHistory(recipient, {
-                type: 'error',
-                content: `Error preparing file for upload: ${error instanceof Error ? error.message : 'Unknown error'}`,
-                transferId: transferId,
-              });
-              setTransferProgress((p) => ({ ...p, [transferId!]: 'Error' }));
-              sendingFiles.current.delete(transferId); // Clean up failed state
+            case ServerMessageType.SERVER_PUBLIC_KEY: {
+              try {
+                const ik = await importPublicKeyPem(message.publicKey);
+                setServerPublicKey(ik);
+              } catch (e) {
+                console.error('[ERROR] Failed to import server public key:', e);
+                setLoginError('Error processing server key.');
+                if (ws.current) ws.current.close();
+              }
+              break;
             }
-          } else {
-            console.warn(`[WS] Received FILE_ACCEPT_NOTICE for unknown or already handled transfer:`, message);
+            case ServerMessageType.RECEIVE_PUBLIC_KEY: {
+              try {
+                const ik = await importUserPublicKey(message.publicKey);
+                setPeerPublicKeys((p) => new Map(p).set(message.username, ik));
+                addMessageToHistory(message.username, {
+                  type: 'system',
+                  content: `Encryption key received for ${message.username}. Ready for secure messages.`,
+                });
+              } catch (ie) {
+                console.error(`Failed to import public key for ${message.username}:`, ie);
+                addMessageToHistory(message.username, {
+                  type: 'error',
+                  content: `Received an invalid key from ${message.username}. Cannot establish secure channel.`,
+                });
+              }
+              break;
+            }
+            case ServerMessageType.RECEIVE_MESSAGE: {
+              const { sender, isBroadcast, payload } = message;
+              const { iv, encryptedKey, ciphertext } = payload;
+              const mpk = keyPairRef.current?.privateKey;
+              const targetChatKey = isBroadcast ? ALL_CHAT_KEY : sender;
+
+              if (!mpk) {
+                addMessageToHistory(targetChatKey, {
+                  type: 'error',
+                  content: '[Error] Cannot decrypt message: Missing your private key.',
+                });
+                break;
+              }
+              try {
+                const akb = await decryptRsaOaep(mpk, encryptedKey);
+                const ak = await importAesKeyRaw(bufferToBase64(akb));
+                const dc = await decryptAesGcm(ak, iv, ciphertext);
+                const dt = new TextDecoder().decode(dc);
+
+                const urlMatch = dt.match(/(https?:\/\/firebasestorage\.googleapis\.com\S+)/);
+                const nameMatch = dt.match(/Here is the file: (.*)\n/);
+                let displayContent: string | React.ReactNode = dt;
+                let fileInfo: PersistedDisplayMessage['fileInfo'] | undefined = undefined;
+                let isFirebaseFile = false;
+
+                if (urlMatch && nameMatch) {
+                  isFirebaseFile = true;
+                  const fileName = nameMatch[1].trim();
+                  const fileUrl = urlMatch[1];
+                  fileInfo = { name: fileName, url: fileUrl };
+                  displayContent = (
+                    <span>
+                      Received file: {fileName} <br />
+                      <a
+                        href={fileUrl}
+                        target="_blank"
+                        rel="noopener noreferrer"
+                        className="text-blue-600 hover:underline break-all"
+                        title={`Download ${fileName}`}
+                      >
+                        Download Link
+                      </a>
+                    </span>
+                  );
+                }
+
+                addMessageToHistory(targetChatKey, {
+                  type: 'chat',
+                  content: displayContent,
+                  sender: sender,
+                  isEncrypted: true,
+                  isFirebaseFile: isFirebaseFile,
+                  fileInfo: fileInfo,
+                });
+              } catch (de) {
+                console.error(`Failed to decrypt message from ${sender}:`, de);
+                addMessageToHistory(targetChatKey, {
+                  type: 'error',
+                  content: `[Decryption Failed for message from ${sender}]`,
+                  sender: sender,
+                });
+              }
+              break;
+            }
+            case ServerMessageType.PING: {
+              try {
+                sendData({ type: ClientMessageType.PONG });
+              } catch (e) {
+                console.error('[ERROR] Failed to send PONG:', e);
+              }
+              break;
+            }
+            default:
+              const unknownType = (message as any)?.type;
+              console.warn(`[WS] Unhandled server message type: ${unknownType}`, message);
+              break;
           }
-          break;
-        }
-        case ServerMessageType.FILE_REJECT_NOTICE: {
-          const { recipient, fileInfo } = message;
-          let tid: string | null = null;
-          sendingFiles.current.forEach((s, id) => { if ( s.recipient === recipient && s.fileInfo.name === fileInfo.name && s.status === 'pending_accept' ) tid = id; });
-          if (tid) {
-            sendingFiles.current.delete(tid); // Remove the pending state
-            addMessageToHistory(recipient, { type: 'file_notice', content: `User rejected file: ${fileInfo.name}`, transferId: tid });
-            setTransferProgress((p) => { const n = { ...p }; delete n[tid!]; return n; });
-          }
-          break;
-        }
-        case ServerMessageType.FILE_URL: {
-          const { sender, fileInfo, downloadUrl } = message;
-          console.log(`[WS] Received file URL from ${sender} for ${fileInfo.name}`);
-          addMessageToHistory(sender, {
-            type: 'file_notice', // Or potentially a new type like 'file_ready'
-            sender: sender,
-            content: `Received file: ${fileInfo.name}. Click to download.`,
-            fileInfo: fileInfo,
-            downloadUrl: downloadUrl, // Store the URL for the download button
-            // transferId might not be relevant here anymore, depends on flow
+        } catch (error) {
+          console.error('[WS] Error processing message:', error, 'Raw:', event.data);
+          addMessageToHistory(ALL_CHAT_KEY, {
+            type: 'error',
+            content: `[Client Error]: Failed processing incoming server message. Check console for details.`,
           });
-          break;
         }
-        default:
-          console.warn('[WS] Unhandled server message type:', (message as any).type);
-        }
-      } catch (error) {
-        console.error('[WS] Error processing message:', error, 'Raw:', event.data);
-        addMessageToHistory(ALL_CHAT_KEY, {
-          type: 'error',
-          content: `[Client Error]: Failed processing message.`,
-        });
-      }
+      };
     };
-    if (ws.current) {
-      ws.current.onmessage = handleServerMessage; // Assign the handler
-    }
+
     if (connectTimeoutId.current) clearTimeout(connectTimeoutId.current);
     connectTimeoutId.current = setTimeout(() => {
       if (isEffectMounted) connect();
     }, 10);
+
     return () => {
       isEffectMounted = false;
       console.log('[WS] Connection useEffect cleanup.');
-      Object.values(chatHistories)
-        .flat()
-        .forEach((m) => {
-          if (m.objectUrl) URL.revokeObjectURL(m.objectUrl);
-        });
       if (connectTimeoutId.current) clearTimeout(connectTimeoutId.current);
       if (reconnectTimeoutId.current) clearTimeout(reconnectTimeoutId.current);
       const stc = localWsInstance;
@@ -885,11 +837,13 @@ function App(): React.ReactElement {
         if (stc.readyState === WebSocket.OPEN || stc.readyState === WebSocket.CONNECTING) {
           try {
             stc.close(1000, 'Component unmounted');
-          } catch (e) {}
+          } catch (e) {
+            console.warn('[WS] Error closing WebSocket during cleanup:', e);
+          }
         }
       }
     };
-  }, [addMessageToHistory]); // Keep dependency array minimal
+  }, [addMessageToHistory]);
 
   // Effect for Sharing User's Public Key
   useEffect(() => {
@@ -1122,11 +1076,11 @@ function App(): React.ReactElement {
         if (fileInputRef.current) fileInputRef.current.value = ''; // Clear input
         return;
       }
-        setSelectedFile(f);
-        addMessageToHistory(currentChatKey, { type: 'system', content: `Selected file: ${f.name}. Ready to send request.`});
-      } else {
-        setSelectedFile(null);
-      }
+      setSelectedFile(f);
+      addMessageToHistory(currentChatKey, { type: 'system', content: `Selected file: ${f.name}. Ready to send request.`});
+    } else {
+      setSelectedFile(null);
+    }
     if (fileInputRef.current) fileInputRef.current.value = '';
   };
   const handleSendFile = async () => {
@@ -1198,65 +1152,6 @@ function App(): React.ReactElement {
       });
     }
   };
-  const sendChunk = (transferId: string, state: SendingFileState) => {
-    if (!state.encryptedContent || state.status !== 'sending') {
-      if (state.status !== 'complete' && state.status !== 'rejected') {
-        sendingFiles.current.delete(transferId);
-        setTransferProgress((p) => {
-          const n = { ...p };
-          delete n[transferId];
-          return n;
-        });
-        addMessageToHistory(state.recipient, {
-          type: 'error',
-          content: `Transfer failed internally.`,
-          transferId,
-        });
-      }
-      return;
-    }
-    if (!ws.current || ws.current.readyState !== WebSocket.OPEN) {
-      state.status = 'error';
-      addMessageToHistory(state.recipient, {
-        type: 'error',
-        content: `Transfer failed: Connection lost.`,
-        transferId,
-      });
-      setTransferProgress((p) => ({ ...p, [transferId]: -1 }));
-      return;
-    }
-    const s = state.nextChunkIndex * CHUNK_SIZE;
-    const e = Math.min(s + CHUNK_SIZE, state.encryptedContent.byteLength);
-    const c = state.encryptedContent.slice(s, e);
-    const ilc = e >= state.encryptedContent.byteLength;
-    sendData({
-      type: ClientMessageType.FILE_CHUNK,
-      recipient: state.recipient,
-      fileInfo: { name: state.fileInfo.name },
-      chunkData: bufferToBase64(c),
-      chunkIndex: state.nextChunkIndex,
-      isLastChunk: ilc,
-    });
-    state.nextChunkIndex++;
-    const pr = Math.round((state.nextChunkIndex / state.totalChunks) * 100);
-    setTransferProgress((p) => ({ ...p, [transferId]: pr }));
-    if (ilc) {
-      state.status = 'complete';
-      addMessageToHistory(state.recipient, {
-        type: 'file_notice',
-        content: `File sent: ${state.fileInfo.name}`,
-        transferId,
-      });
-    } else {
-      setTimeout(() => {
-        if (
-          sendingFiles.current.has(transferId) &&
-          sendingFiles.current.get(transferId)?.status === 'sending'
-        )
-          sendChunk(transferId, state);
-      }, 10);
-    }
-  };
   const handleAcceptFile = async (transferId: string) => {
     const r = incomingFileRequests.get(transferId);
     if (!r) return;
@@ -1282,11 +1177,6 @@ function App(): React.ReactElement {
     addMessageToHistory(sender, {
       type: 'file_notice',
       content: `Accepted file: ${fileInfo.name}. Receiving...`,
-      transferId,
-    });
-    addMessageToHistory(sender, {
-      type: 'error',
-      content: `Accept failed: ${e instanceof Error ? e.message : 'Error'}`,
       transferId,
     });
     console.log(`[WS] Sent FILE_TRANSFER_ACCEPT for transfer ${transferId}`);
@@ -1362,12 +1252,11 @@ function App(): React.ReactElement {
   // Render UI
   return (
     <div className="flex flex-col h-screen bg-gradient-to-br from-blue-100 via-purple-100 to-pink-100 p-4 gap-4 font-sans">
-      {/* Header (Unchanged) */}
+      {/* Header */}
       <header className="text-center py-2">
         <h1 className="text-2xl font-bold text-gray-800">Secure Chat</h1>
         <div className="text-sm text-gray-600 mt-1 flex items-center justify-center gap-x-2 flex-wrap">
           <span>
-            {' '}
             Status:{' '}
             {isConnected ? (
               <span className="text-green-600 font-semibold">Connected</span>
@@ -1394,7 +1283,7 @@ function App(): React.ReactElement {
 
       {/* Main Layout */}
       <div className="flex flex-1 gap-4 overflow-hidden">
-        {/* Sidebar (MODIFIED - Iterates over displayablePeers) */}
+        {/* Sidebar */}
         <Card className="w-60 flex flex-col bg-white/80 backdrop-blur-sm border-gray-200 shadow-md rounded-lg">
           <CardHeader className="p-3 border-b bg-gray-50/80 rounded-t-lg">
             <CardTitle className="text-lg text-gray-700">Conversations</CardTitle>
@@ -1409,9 +1298,8 @@ function App(): React.ReactElement {
                 disabled={!isLoggedIn}
                 title="Switch to All Chat (Broadcast)"
               >
-                {' '}
-                <Users className="h-5 w-5 text-gray-600" />{' '}
-                <span className="font-medium">All Chat</span>{' '}
+                <Users className="h-5 w-5 text-gray-600" />
+                <span className="font-medium">All Chat</span>
               </Button>
               <hr className="my-2 border-gray-200" />
               {/* Conversation List */}
@@ -1485,15 +1373,13 @@ function App(): React.ReactElement {
 
         {/* Chat Area */}
         <Card className="flex-1 flex flex-col bg-white/80 backdrop-blur-sm border-gray-200 shadow-md rounded-lg overflow-hidden">
-          {/* Chat Header (Unchanged) */}
+          {/* Chat Header */}
           <CardHeader className="p-3 border-b bg-gray-50/80 rounded-t-lg">
             <div className="flex justify-between items-center">
               <div className="flex items-center gap-2">
-                {' '}
                 <CardTitle className="text-lg text-gray-700">
-                  {' '}
-                  {selectedUser ? `Chat with ${selectedUser}` : 'All Chat'}{' '}
-                </CardTitle>{' '}
+                  {selectedUser ? `Chat with ${selectedUser}` : 'All Chat'}
+                </CardTitle>
               </div>
               {selectedUser && (
                 <Button
@@ -1503,8 +1389,7 @@ function App(): React.ReactElement {
                   className="text-xs text-blue-600 hover:text-blue-800"
                   title="Back to All Chat"
                 >
-                  {' '}
-                  <X className="h-4 w-4 mr-1" /> Back to All{' '}
+                  <X className="h-4 w-4 mr-1" /> Back to All
                 </Button>
               )}
             </div>
@@ -1534,39 +1419,33 @@ function App(): React.ReactElement {
                         variant="default"
                         className="bg-blue-50 border-blue-200"
                       >
-                        {' '}
-                        <FileIcon className="h-4 w-4" />{' '}
+                        <FileIcon className="h-4 w-4" />
                         <AlertTitle className="font-semibold">
                           Incoming File from {msg.sender}
-                        </AlertTitle>{' '}
+                        </AlertTitle>
                         <AlertDescription className="text-sm">
-                          {' '}
                           <p className="mb-2">
-                            {' '}
                             User <span className="font-medium">{msg.sender}</span> wants to send you{' '}
                             <span className="font-medium">{msg.fileInfo.name}</span> ({' '}
-                            {(msg.fileInfo.size / 1024 / 1024).toFixed(2)} MB).{' '}
-                          </p>{' '}
+                            {(msg.fileInfo.size / 1024 / 1024).toFixed(2)} MB).
+                          </p>
                           <div className="flex gap-2 mt-2">
-                            {' '}
                             <Button
                               size="sm"
                               variant="default"
                               onClick={() => handleAcceptFile(msg.transferId!)}
                             >
-                              {' '}
-                              <Check className="h-4 w-4 mr-1" /> Accept{' '}
-                            </Button>{' '}
+                              <Check className="h-4 w-4 mr-1" /> Accept
+                            </Button>
                             <Button
                               size="sm"
                               variant="destructive"
                               onClick={() => handleRejectFile(msg.transferId!)}
                             >
-                              {' '}
-                              <X className="h-4 w-4 mr-1" /> Reject{' '}
-                            </Button>{' '}
-                          </div>{' '}
-                        </AlertDescription>{' '}
+                              <X className="h-4 w-4 mr-1" /> Reject
+                            </Button>
+                          </div>
+                        </AlertDescription>
                       </Alert>
                     );
                   }
@@ -1581,15 +1460,13 @@ function App(): React.ReactElement {
                         variant="default"
                         className="bg-gray-50 border-gray-200 text-xs"
                       >
-                        {' '}
-                        <FileIcon className="h-4 w-4" />{' '}
+                        <FileIcon className="h-4 w-4" />
                         <AlertDescription>
-                          {' '}
                           {st}{' '}
                           {(iS || iR) && p !== null && p >= 0 && p <= 100 && (
                             <Progress value={p} className="w-full h-2 mt-1" />
-                          )}{' '}
-                        </AlertDescription>{' '}
+                          )}
+                        </AlertDescription>
                       </Alert>
                     );
                   }
@@ -1601,37 +1478,32 @@ function App(): React.ReactElement {
                           msg.sender === currentUsername ? 'items-end' : 'items-start'
                         }`}
                       >
-                        {' '}
                         <div className="p-2 border rounded-lg bg-gray-100 max-w-xs md:max-w-sm">
-                          {' '}
                           <p className="text-xs font-semibold mb-1 text-gray-700">
                             {msg.sender}
-                          </p>{' '}
+                          </p>
                           <img
                             src={msg.objectUrl}
                             alt={`Image from ${msg.sender}: ${msg.fileInfo.name}`}
                             className="max-w-full h-auto rounded block object-contain bg-white"
-                          />{' '}
+                          />
                           <div className="flex justify-between items-center mt-2">
-                            {' '}
                             <span
                               className="text-xs text-gray-600 truncate"
                               title={msg.fileInfo.name}
                             >
-                              {' '}
-                              {msg.fileInfo.name}{' '}
-                            </span>{' '}
+                              {msg.fileInfo.name}
+                            </span>
                             <Button
                               size="sm"
                               variant="outline"
                               className="h-7 px-2 text-xs"
                               onClick={() => handleDownloadFile(msg.objectUrl, msg.fileInfo?.name)}
                             >
-                              {' '}
-                              <Download className="h-3 w-3 mr-1" /> Download{' '}
-                            </Button>{' '}
-                          </div>{' '}
-                        </div>{' '}
+                              <Download className="h-3 w-3 mr-1" /> Download
+                            </Button>
+                          </div>
+                        </div>
                       </div>
                     );
                   }
@@ -1668,7 +1540,6 @@ function App(): React.ReactElement {
                             msg.type === 'my_chat' ? 'items-end' : 'items-start'
                           }`}
                         >
-                          {' '}
                           <div
                             className={`max-w-xs md:max-w-md lg:max-w-lg rounded-lg px-3 py-2 shadow-sm text-sm ${
                               msg.type === 'my_chat'
@@ -1676,20 +1547,18 @@ function App(): React.ReactElement {
                                 : 'bg-gray-100 text-gray-900'
                             }`}
                           >
-                            {' '}
                             {msg.sender && msg.type !== 'my_chat' && (
                               <p className="text-xs font-semibold mb-0.5 text-gray-700">
                                 {msg.sender}
                               </p>
-                            )}{' '}
-                            {rc}{' '}
-                          </div>{' '}
+                            )}
+                            {rc}
+                          </div>
                         </div>
                       );
                     } else {
                       return (
                         <div key={messageKey} className={`flex flex-col items-center w-full`}>
-                          {' '}
                           <div
                             className={`max-w-full rounded-lg px-3 py-1 break-words shadow-none text-xs text-center ${
                               msg.type === 'error'
@@ -1697,9 +1566,8 @@ function App(): React.ReactElement {
                                 : 'text-gray-500 italic bg-transparent'
                             }`}
                           >
-                            {' '}
-                            {rc}{' '}
-                          </div>{' '}
+                            {rc}
+                          </div>
                         </div>
                       );
                     }
@@ -1715,14 +1583,12 @@ function App(): React.ReactElement {
           <CardFooter className="p-4 border-t bg-gray-50/80">
             {!isLoggedIn ? (
               /* Login Form */ <form onSubmit={handleLogin} className="w-full space-y-3">
-                {' '}
-                <h3 className="text-center font-medium text-gray-700">Please Log In</h3>{' '}
-                {loginError && <p className="text-red-500 text-sm text-center">{loginError}</p>}{' '}
+                <h3 className="text-center font-medium text-gray-700">Please Log In</h3>
+                {loginError && <p className="text-red-500 text-sm text-center">{loginError}</p>}
                 {systemMessage && !loginError && (
                   <p className="text-yellow-600 text-sm text-center">{systemMessage}</p>
-                )}{' '}
+                )}
                 <div className="flex flex-col sm:flex-row gap-2">
-                  {' '}
                   <Input
                     type="text"
                     placeholder="Username"
@@ -1733,7 +1599,7 @@ function App(): React.ReactElement {
                     className="flex-1"
                     autoComplete="username"
                     required
-                  />{' '}
+                  />
                   <Input
                     type="password"
                     placeholder="Password"
@@ -1744,8 +1610,8 @@ function App(): React.ReactElement {
                     className="flex-1"
                     autoComplete="current-password"
                     required
-                  />{' '}
-                </div>{' '}
+                  />
+                </div>
                 <Button
                   type="submit"
                   disabled={
@@ -1755,13 +1621,12 @@ function App(): React.ReactElement {
                   }
                   className="w-full"
                 >
-                  {' '}
                   {!keyPairRef.current
                     ? 'Generating Keys...'
                     : !isConnected
                       ? 'Connecting...'
-                      : 'Login / Register'}{' '}
-                </Button>{' '}
+                      : 'Login / Register'}
+                </Button>
               </form>
             ) : (
               /* Message Input Form Area */
@@ -1789,8 +1654,7 @@ function App(): React.ReactElement {
                       !selectedUser || !fileTransferReady ? 'text-gray-400 cursor-not-allowed' : ''
                     }`}
                   >
-                    {' '}
-                    <Paperclip className="h-5 w-5" />{' '}
+                    <Paperclip className="h-5 w-5" />
                   </Button>
                   <input
                     type="file"
@@ -1801,15 +1665,13 @@ function App(): React.ReactElement {
                   />
                   {selectedFile && selectedUser ? (
                     <div className="flex items-center gap-2 flex-1 bg-gray-100 p-1 rounded-md border h-10">
-                      {' '}
-                      <FileIcon className="h-4 w-4 text-gray-600 shrink-0 ml-1" />{' '}
+                      <FileIcon className="h-4 w-4 text-gray-600 shrink-0 ml-1" />
                       <span
                         className="text-sm text-gray-700 truncate flex-1"
                         title={selectedFile.name}
                       >
-                        {' '}
-                        {selectedFile.name} ({(selectedFile.size / 1024).toFixed(1)} KB){' '}
-                      </span>{' '}
+                        {selectedFile.name} ({(selectedFile.size / 1024).toFixed(1)} KB)
+                      </span>
                       <Button
                         type="button"
                         size="icon"
@@ -1818,9 +1680,8 @@ function App(): React.ReactElement {
                         onClick={() => setSelectedFile(null)}
                         title="Cancel file selection"
                       >
-                        {' '}
-                        <Trash2 className="h-4 w-4 text-red-500" />{' '}
-                      </Button>{' '}
+                        <Trash2 className="h-4 w-4 text-red-500" />
+                      </Button>
                       <Button
                         type="button"
                         size="sm"
@@ -1829,9 +1690,8 @@ function App(): React.ReactElement {
                         title={`Send file to ${selectedUser}`}
                         disabled={!fileTransferReady}
                       >
-                        {' '}
-                        <Upload className="h-4 w-4 mr-1" /> Send{' '}
-                      </Button>{' '}
+                        <Upload className="h-4 w-4 mr-1" /> Send
+                      </Button>
                     </div>
                   ) : (
                     <div className="flex-1 relative flex items-center">
@@ -1856,10 +1716,9 @@ function App(): React.ReactElement {
                       {/* Emoji Picker */}
                       <Popover open={showEmojiPicker} onOpenChange={setShowEmojiPicker}>
                         <PopoverTrigger
-                          className="absolute right-1 top-1/2 -translate-y-1/2 h-7 w-7 p-0 inline-flex items-center justify-center rounded-md text-sm font-medium transition-colors focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-ring disabled:pointer-events-none disabled:opacity-50 text-gray-500 hover:bg-accent hover:text-accent-foreground" // Styles copied from Button variant=ghost, size=icon
+                          className="absolute right-1 top-1/2 -translate-y-1/2 h-7 w-7 p-0 inline-flex items-center justify-center rounded-md text-sm font-medium transition-colors focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-ring disabled:pointer-events-none disabled:opacity-50 text-gray-500 hover:bg-accent hover:text-accent-foreground"
                           title="Select emoji"
                         >
-                          {/* Icon is now the direct child */}
                           <Smile className="h-5 w-5" />
                         </PopoverTrigger>
                         <PopoverContent className="w-auto p-0 mb-1" side="top" align="end">
@@ -1884,8 +1743,7 @@ function App(): React.ReactElement {
                       disabled={!inputValue.trim() || !isConnected || !serverPublicKey}
                       className="shrink-0"
                     >
-                      {' '}
-                      <SendHorizonal className="h-4 w-4" />{' '}
+                      <SendHorizonal className="h-4 w-4" />
                     </Button>
                   )}
                   <Button
@@ -1898,8 +1756,7 @@ function App(): React.ReactElement {
                     disabled={!isLoggedIn}
                     className="shrink-0"
                   >
-                    {' '}
-                    <LogOut className="h-4 w-4" />{' '}
+                    <LogOut className="h-4 w-4" />
                   </Button>
                 </div>
               </div>

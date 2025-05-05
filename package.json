@@ -23,6 +23,7 @@
     "bcrypt": "^5.1.1",
     "dompurify": "^3.2.5",
     "emoji-picker-react": "^4.12.2",
+    "firebase": "^11.6.1",
     "firebase-admin": "^13.2.0",
     "marked": "^15.0.8",
     "mongodb": "^6.15.0",
