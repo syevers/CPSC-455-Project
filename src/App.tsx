@@ -4,7 +4,8 @@ import DOMPurify from 'dompurify';
 import EmojiPicker, { EmojiClickData, Theme as EmojiTheme } from 'emoji-picker-react';
 import { marked } from 'marked';
 import TextareaAutosize from 'react-textarea-autosize';
-
+import { storage } from './firebase'; // adjust path as needed
+import { ref, uploadBytes } from 'firebase/storage';
 // Shadcn UI Component Imports
 import { Alert, AlertDescription, AlertTitle } from '@/components/ui/alert';
 import { Button } from '@/components/ui/button';
@@ -29,6 +30,7 @@ import {
   Smile,
   Trash2,
   Unlock,
+  Upload,
   User,
   Users,
   X,
@@ -36,23 +38,13 @@ import {
 
 // Constants
 const MAX_FILE_SIZE = 10 * 1024 * 1024;
-
+const CHUNK_SIZE = 64 * 1024;
 // UPDATED SERVER URL:
 const SERVER_URL = 'wss://cpsc-455-project-wiii.onrender.com';
 const ALL_CHAT_KEY = 'All Chat';
 const TYPING_TIMEOUT_MS = 2000; // Stop typing after 2 seconds of inactivity
 const TYPING_THROTTLE_MS = 5000; // Send START_TYPING max once every 5 seconds
 
-// Basic Malware Scanning Configuration
-const ALLOWED_FILE_EXTENSIONS = [
-  '.txt', '.pdf', '.doc', '.docx', '.jpg', '.jpeg', '.png', '.gif', '.mp3', '.mp4',
-  '.zip', '.rar', '.7z', '.csv', '.xls', '.xlsx', '.ppt', '.pptx', '.md',
-];
-const SUSPICIOUS_PATTERNS = [
-  /<script\b[^<]*(?:(?!<\/script>)<[^<]*)*<\/script>/gi, // JavaScript tags
-  /eval\(/gi, // eval() function
-  /document\.execCommand/gi, // Potential malicious commands
-];
 // Crypto Helper Functions
 const bufferToBase64 = (buffer: ArrayBuffer): string => {
   let b = '';
@@ -160,47 +152,6 @@ const decryptRsaOaep = async (privateKey: CryptoKey, base64Data: string): Promis
   }
 };
 
-// Basic Malware Scanning Function
-const scanFileForMalware = async (file: File): Promise<{ isSafe: boolean; message: string }> => {
-  // Check file size
-  if (file.size > MAX_FILE_SIZE) {
-    return { isSafe: false, message: `File size exceeds maximum limit of ${MAX_FILE_SIZE / 1024 / 1024}MB.` };
-  }
-
-  // Check file extension
-  const extension = '.' + file.name.split('.').pop()?.toLowerCase();
-  if (!extension || !ALLOWED_FILE_EXTENSIONS.includes(extension)) {
-    return {
-      isSafe: false,
-      message: `File type not allowed. Allowed types: ${ALLOWED_FILE_EXTENSIONS.join(', ')}`,
-    };
-  }
-
-  // Basic content scanning (for text-based or scriptable files)
-  if (
-    file.type.startsWith('text/') ||
-    file.type.includes('javascript') ||
-    file.type.includes('html')
-  ) {
-    try {
-      const text = await file.text();
-      for (const pattern of SUSPICIOUS_PATTERNS) {
-        if (pattern.test(text)) {
-          return {
-            isSafe: false,
-            message: 'File contains potentially malicious content (suspicious script detected).',
-          };
-        }
-      }
-    } catch (e) {
-      return { isSafe: false, message: 'Failed to scan file content.' };
-    }
-  }
-
-  // Additional checks could be added here (e.g., magic number validation for images/PDFs)
-  return { isSafe: true, message: 'File appears safe.' };
-};
-
 // Message Types
 enum ClientMessageType {
   LOGIN = 'login',
@@ -210,7 +161,10 @@ enum ClientMessageType {
   REQUEST_PUBLIC_KEY = 'request_public_key',
   PING = 'ping',
   PONG = 'pong',
-  FILE_SCAN_COMPLETE = 'file_scan_complete',
+  FILE_TRANSFER_REQUEST = 'file_transfer_request',
+  FILE_TRANSFER_ACCEPT = 'file_transfer_accept',
+  FILE_TRANSFER_REJECT = 'file_transfer_reject',
+  FILE_CHUNK = 'file_chunk',
   REQUEST_HISTORY = 'request_history',
   START_TYPING = 'start_typing',
   STOP_TYPING = 'stop_typing',
@@ -223,8 +177,10 @@ enum ServerMessageType {
   RECEIVE_PUBLIC_KEY = 'receive_public_key',
   PONG = 'pong',
   PING = 'ping',
-  FILE_SCAN_VERIFIED_CLEAN = 'file_scan_verified_clean',
-  FILE_SCAN_FAILED = 'file_scan_failed',
+  INCOMING_FILE_REQUEST = 'incoming_file_request',
+  FILE_ACCEPT_NOTICE = 'file_accept_notice',
+  FILE_REJECT_NOTICE = 'file_reject_notice',
+  FILE_CHUNK_RECEIVE = 'file_chunk_receive',
   RECEIVE_HISTORY = 'receive_history',
   USER_TYPING = 'user_typing',
   USER_STOPPED_TYPING = 'user_stopped_typing',
@@ -260,7 +216,37 @@ interface ServerReceiveMessage extends ServerMessageBase {
   isBroadcast: boolean;
   payload: { iv: string; encryptedKey: string; ciphertext: string };
 }
-
+// File Transfer Interfaces
+interface FileInfo {
+  name: string;
+  size: number;
+  type: string;
+  iv: string;
+  encryptedKey: string;
+}
+interface IncomingFileRequestMessage extends ServerMessageBase {
+  type: ServerMessageType.INCOMING_FILE_REQUEST;
+  sender: string;
+  fileInfo: FileInfo;
+}
+interface FileAcceptNoticeMessage extends ServerMessageBase {
+  type: ServerMessageType.FILE_ACCEPT_NOTICE;
+  recipient: string;
+  fileInfo: { name: string; size: number };
+}
+interface FileRejectNoticeMessage extends ServerMessageBase {
+  type: ServerMessageType.FILE_REJECT_NOTICE;
+  recipient: string;
+  fileInfo: { name: string };
+}
+interface FileChunkReceiveMessage extends ServerMessageBase {
+  type: ServerMessageType.FILE_CHUNK_RECEIVE;
+  sender: string;
+  fileInfo: { name: string };
+  chunkData: string;
+  chunkIndex: number;
+  isLastChunk: boolean;
+}
 // History Interfaces
 interface PersistedDisplayMessage {
   type: 'system' | 'chat' | 'my_chat' | 'error';
@@ -288,17 +274,7 @@ interface UserStoppedTypingMessage extends ServerMessageBase {
   sender: string;
   recipient?: string;
 }
-interface FileScanVerifiedCleanMessage extends ServerMessageBase {
-  type: ServerMessageType.FILE_SCAN_VERIFIED_CLEAN;
-  fileInfo: { name: string };
-  uploadUrl?: string;
-  firebasePath?: string;
-}
-interface FileScanFailedMessage extends ServerMessageBase {
-  type: ServerMessageType.FILE_SCAN_FAILED;
-  fileInfo: { name: string };
-  reason: string;
-}
+
 // Combined type for all possible server messages
 type ServerMessage =
   | SystemMessage
@@ -307,33 +283,25 @@ type ServerMessage =
   | ServerPublicKeyMessage
   | ServerReceiveMessage
   | PingMessage
-  | FileScanVerifiedCleanMessage
-  | FileScanFailedMessage
+  | IncomingFileRequestMessage
+  | FileAcceptNoticeMessage
+  | FileRejectNoticeMessage
+  | FileChunkReceiveMessage
   | ReceiveHistoryMessage
   | UserTypingMessage
   | UserStoppedTypingMessage;
 
-  interface DisplayFileInfo {
-    name: string;
-    size?: number;
-    type?: string;
-    firebasePath?: string;
-    sender?: string;
-}
-
-type DisplayMessageType = 'system' | 'chat' | 'my_chat' | 'error' | 'file_notice' | 'file_image'| 'file_download_link';
 // UI State Interfaces
 interface DisplayMessage {
-  type: DisplayMessageType;
+  type: 'system' | 'chat' | 'my_chat' | 'error' | 'file_request' | 'file_notice' | 'file_image';
   content: string | React.ReactNode;
   sender?: string;
   recipient?: string;
   timestamp?: number;
   isEncrypted?: boolean;
-  fileInfo?: DisplayFileInfo;
+  fileInfo?: FileInfo | { name: string; size?: number; type?: string };
+  transferId?: string;
   objectUrl?: string;
-  uploadProgress?: number;
-  isUploading?: boolean;
 }
 interface ChatHistories {
   [peerUsernameOrAllChat: string]: DisplayMessage[];
@@ -342,6 +310,33 @@ interface ChatHistories {
 interface TypingUsersState {
   [peerKey: string]: Set<string>;
 }
+
+// File Transfer State Interfaces
+interface FileTransferRequest {
+  id: string;
+  sender: string;
+  fileInfo: FileInfo;
+  timestamp: number;
+}
+interface SendingFileState {
+  file: File;
+  encryptedContent: ArrayBuffer | null;
+  recipient: string;
+  fileInfo: FileInfo;
+  totalChunks: number;
+  nextChunkIndex: number;
+  status: 'pending_accept' | 'sending' | 'complete' | 'rejected' | 'error';
+}
+interface ReceivingFileState {
+  id: string;
+  sender: string;
+  fileInfo: FileInfo;
+  aesKey: CryptoKey | null;
+  chunks: ArrayBuffer[];
+  receivedBytes: number;
+  status: 'receiving' | 'complete' | 'error' | 'decrypting';
+}
+
 // Helper to generate unique IDs
 const generateUniqueId = () =>
   `transfer_${Date.now()}_${Math.random().toString(36).substring(2, 9)}`;
@@ -374,6 +369,12 @@ function App(): React.ReactElement {
   const [serverPublicKey, setServerPublicKey] = useState<CryptoKey | null>(null);
   const fileInputRef = useRef<HTMLInputElement | null>(null);
   const [selectedFile, setSelectedFile] = useState<File | null>(null);
+  const [incomingFileRequests, setIncomingFileRequests] = useState<
+    Map<string, FileTransferRequest>
+  >(new Map());
+  const sendingFiles = useRef<Map<string, SendingFileState>>(new Map());
+  const receivingFiles = useRef<Map<string, ReceivingFileState>>(new Map());
+  const [transferProgress, setTransferProgress] = useState<{ [transferId: string]: number }>({});
   const [showEmojiPicker, setShowEmojiPicker] = useState<boolean>(false);
   const messageInputRef = useRef<HTMLTextAreaElement>(null);
   const [isHistoryLoading, setIsHistoryLoading] = useState<boolean>(false);
@@ -381,8 +382,6 @@ function App(): React.ReactElement {
   const [typingUsers, setTypingUsers] = useState<TypingUsersState>({});
   const typingTimeoutRef = useRef<NodeJS.Timeout | null>(null); // Timeout for STOP_TYPING
   const typingSentTimestampRef = useRef<number>(0); // Throttle START_TYPING
-  const [pendingFileUploads, setPendingFileUploads] = useState<Map<string, File>>(new Map());
-  const [uploadProgressMap, setUploadProgressMap] = useState<Map<string, number>>(new Map());
 
   // Effects
   const currentChatKey = selectedUser ?? ALL_CHAT_KEY;
@@ -395,6 +394,13 @@ function App(): React.ReactElement {
       const newMessage = { ...message, timestamp: Date.now() };
       setChatHistories((prev) => {
         const history = prev[peerKey] || [];
+        if (
+          newMessage.transferId &&
+          (newMessage.type === 'file_notice' || newMessage.type === 'file_request') &&
+          history.some((m) => m.transferId === newMessage.transferId && m.type === newMessage.type)
+        ) {
+          return prev;
+        }
         return { ...prev, [peerKey]: [...history, newMessage] };
       });
     },
@@ -501,11 +507,12 @@ function App(): React.ReactElement {
         console.error('[WS] WebSocket Error:', event);
         isConnecting.current = false;
       };
+
+      // onmessage Handler
       currentRunWs.onmessage = async (event: MessageEvent) => {
-        if (ws.current !== localWsInstance || !isEffectMounted) return;
+        if (ws.current !== currentRunWs || !isEffectMounted) return;
         try {
           const message = JSON.parse(event.data as string) as ServerMessage;
-
           switch (message.type) {
             case ServerMessageType.SYSTEM: {
               const content = message.content ?? '';
@@ -539,26 +546,11 @@ function App(): React.ReactElement {
                 setCurrentUsername('');
                 usernameRef.current = '';
               } else {
-                if (!content.startsWith('Public key for user')) {
+                if (!content.startsWith('Public key for user'))
                   addMessageToHistory(ALL_CHAT_KEY, {
                     type: 'system',
                     content: `[SERVER]: ${content}`,
                   });
-                } else {
-                  const match = content.match(/Public key for user '([^']*)'/);
-                  if (match && match[1]) {
-                    const peerUser = match[1];
-                    addMessageToHistory(peerUser, {
-                      type: 'system',
-                      content: `[SERVER]: ${content}`,
-                    });
-                  } else {
-                    addMessageToHistory(ALL_CHAT_KEY, {
-                      type: 'system',
-                      content: `[SERVER]: ${content}`,
-                    });
-                  }
-                }
               }
               break;
             }
@@ -566,24 +558,7 @@ function App(): React.ReactElement {
               console.log('[WS] Received history from server.');
               setIsHistoryLoading(false);
               if (message.history && typeof message.history === 'object') {
-                const processedHistory: ChatHistories = {};
-                Object.entries(message.history).forEach(([peerKey, messages]) => {
-                  processedHistory[peerKey] = messages.map((msg) => {
-                    if ((msg.type === 'chat' || msg.type === 'my_chat') && typeof msg.content === 'string') {
-                      const urlMatch = msg.content.match(/(https?:\/\/\S+)/);
-                      const nameMatch = msg.content.match(/Here is the file: (.*)\n/);
-                      if (urlMatch && nameMatch) {
-                        return {
-                          ...msg,
-                          isFirebaseFile: true,
-                          fileInfo: { name: nameMatch[1].trim(), url: urlMatch[1] },
-                        };
-                      }
-                    }
-                    return msg;
-                  });
-                });
-                setChatHistories(processedHistory);
+                setChatHistories(message.history as ChatHistories);
                 console.log('[WS] History applied to state.');
               } else {
                 console.error('[WS] Invalid history data received:', message.history);
@@ -630,26 +605,33 @@ function App(): React.ReactElement {
             case ServerMessageType.USER_LIST: {
               const nu = message.users ?? [];
               const lu = usernameRef.current;
+              // Update the online users list state
               setUsers(nu);
-
+              // Check if the currently selected user went offline
               if (selectedUser && !nu.includes(selectedUser)) {
                 addMessageToHistory(selectedUser, {
                   type: 'system',
                   content: `User ${selectedUser} went offline.`,
                 });
+                // Don't deselect the user, just update their status indicator in the sidebar
+                // setSelectedUser(null); // Keep the conversation selected
               }
-
+              // Update peer public keys (request missing keys for newly online users)
               setPeerPublicKeys((pk) => {
                 const uk = new Map(pk);
+                let c = false;
+                // Remove keys for users who are no longer online (optional, could keep keys)
+                // Array.from(uk.keys()).forEach((u) => { if (!nu.includes(u)) { uk.delete(u); c = true; } });
                 if (lu) {
                   nu.forEach((u) => {
                     if (u !== lu && !uk.has(u)) {
+                      // Request key only if not already present
                       console.log(`[WS] Requesting public key for newly online user: ${u}`);
                       sendData({ type: ClientMessageType.REQUEST_PUBLIC_KEY, username: u });
                     }
                   });
                 }
-                return uk;
+                return c ? uk : pk; // Return existing map if no keys were removed
               });
               break;
             }
@@ -668,15 +650,16 @@ function App(): React.ReactElement {
               try {
                 const ik = await importUserPublicKey(message.publicKey);
                 setPeerPublicKeys((p) => new Map(p).set(message.username, ik));
-                addMessageToHistory(message.username, {
-                  type: 'system',
-                  content: `Encryption key received for ${message.username}. Ready for secure messages.`,
-                });
+                if (selectedUser === message.username)
+                  addMessageToHistory(selectedUser, {
+                    type: 'system',
+                    content: `Encryption key received for ${selectedUser}.`,
+                  });
               } catch (ie) {
                 console.error(`Failed to import public key for ${message.username}:`, ie);
                 addMessageToHistory(message.username, {
                   type: 'error',
-                  content: `Received an invalid key from ${message.username}. Cannot establish secure channel.`,
+                  content: `Invalid key from ${message.username}.`,
                 });
               }
               break;
@@ -685,12 +668,10 @@ function App(): React.ReactElement {
               const { sender, isBroadcast, payload } = message;
               const { iv, encryptedKey, ciphertext } = payload;
               const mpk = keyPairRef.current?.privateKey;
-              const targetChatKey = isBroadcast ? ALL_CHAT_KEY : sender;
-
               if (!mpk) {
-                addMessageToHistory(targetChatKey, {
+                addMessageToHistory(isBroadcast ? ALL_CHAT_KEY : sender, {
                   type: 'error',
-                  content: '[Error] Cannot decrypt message: Missing your private key.',
+                  content: '[Error] Cannot decrypt: Missing private key.',
                 });
                 break;
               }
@@ -699,47 +680,17 @@ function App(): React.ReactElement {
                 const ak = await importAesKeyRaw(bufferToBase64(akb));
                 const dc = await decryptAesGcm(ak, iv, ciphertext);
                 const dt = new TextDecoder().decode(dc);
-
-                const urlMatch = dt.match(/(https?:\/\/firebasestorage\.googleapis\.com\S+)/);
-                const nameMatch = dt.match(/Here is the file: (.*)\n/);
-                let displayContent: string | React.ReactNode = dt;
-                let fileInfo: PersistedDisplayMessage['fileInfo'] | undefined = undefined;
-                let isFirebaseFile = false;
-
-                if (urlMatch && nameMatch) {
-                  isFirebaseFile = true;
-                  const fileName = nameMatch[1].trim();
-                  const fileUrl = urlMatch[1];
-                  fileInfo = { name: fileName, url: fileUrl };
-                  displayContent = (
-                    <span>
-                      Received file: {fileName} <br />
-                      <a
-                        href={fileUrl}
-                        target="_blank"
-                        rel="noopener noreferrer"
-                        className="text-blue-600 hover:underline break-all"
-                        title={`Download ${fileName}`}
-                      >
-                        Download Link
-                      </a>
-                    </span>
-                  );
-                }
-
-                addMessageToHistory(targetChatKey, {
+                addMessageToHistory(isBroadcast ? ALL_CHAT_KEY : sender, {
                   type: 'chat',
-                  content: displayContent,
+                  content: dt,
                   sender: sender,
                   isEncrypted: true,
-                  isFirebaseFile: isFirebaseFile,
-                  fileInfo: fileInfo,
                 });
               } catch (de) {
                 console.error(`Failed to decrypt message from ${sender}:`, de);
-                addMessageToHistory(targetChatKey, {
+                addMessageToHistory(isBroadcast ? ALL_CHAT_KEY : sender, {
                   type: 'error',
-                  content: `[Decryption Failed for message from ${sender}]`,
+                  content: `[Decryption Failed from ${sender}]`,
                   sender: sender,
                 });
               }
@@ -753,134 +704,197 @@ function App(): React.ReactElement {
               }
               break;
             }
-            case ServerMessageType.FILE_SCAN_VERIFIED_CLEAN: {
-              const { fileInfo, uploadUrl, firebasePath } = message as FileScanVerifiedCleanMessage; // Type assertion
-              const chatKey = selectedUser || ALL_CHAT_KEY; // Determine context
-
-              // Attempt to find the original file in our pending state
-              const originalFile = pendingFileUploads.get(fileInfo.name);
-
-              if (uploadUrl && originalFile) { // Option B: Client needs to upload
-                addMessageToHistory(chatKey, { // Notify in the correct chat context
-                  type: 'file_notice',
-                  content: `Server verified ${fileInfo.name}. Uploading to storage...`,
-                  fileInfo: { name: fileInfo.name, size: originalFile.size, type: originalFile.type, firebasePath: firebasePath }
-                });
-
-                // Start the upload to Firebase Signed URL
-                try {
-                    // Use XMLHttpRequest for progress tracking, or simple fetch
-                    const xhr = new XMLHttpRequest();
-                    xhr.open('PUT', uploadUrl, true);
-                    xhr.setRequestHeader('Content-Type', originalFile.type || 'application/octet-stream');
-
-                    // Progress handling
-                    xhr.upload.onprogress = (event) => {
-                        if (event.lengthComputable) {
-                            const percentComplete = Math.round((event.loaded / event.total) * 100);
-                            setUploadProgressMap(prev => new Map(prev).set(firebasePath || fileInfo.name, percentComplete));
-                        }
-                    };
-
-                    xhr.onload = () => {
-                        if (xhr.status >= 200 && xhr.status < 300) {
-                            console.log(`Successfully uploaded ${fileInfo.name} to Firebase.`);
-                            addMessageToHistory(chatKey, {
-                                type: 'file_notice', // Or maybe a 'file_download_link' type later?
-                                content: `Successfully uploaded ${fileInfo.name}.`,
-                                fileInfo: { name: fileInfo.name, firebasePath: firebasePath }
-                            });
-                             // Clean up the stored file object and progress after successful upload
-                             setPendingFileUploads(prev => { const next = new Map(prev); next.delete(fileInfo.name); return next; });
-                             setUploadProgressMap(prev => { const next = new Map(prev); next.delete(firebasePath || fileInfo.name); return next; });
-
-                             // Optional: Notify server of successful upload?
-                             // sendData({ type: 'file_upload_complete_to_firebase', firebasePath: firebasePath });
-                        } else {
-                            throw new Error(`Storage upload failed: ${xhr.status} ${xhr.statusText}`);
-                        }
-                    };
-
-                    xhr.onerror = () => {
-                        throw new Error('Storage upload failed due to network error.');
-                    };
-
-                    xhr.send(originalFile);
-                    // Set initial progress state
-                    setUploadProgressMap(prev => new Map(prev).set(firebasePath || fileInfo.name, 0));
-
-
-                } catch (uploadError: any) {
-                    console.error(`[ERROR] Firebase upload failed for ${fileInfo.name}:`, uploadError);
-                    addMessageToHistory(chatKey, { type: 'error', content: `Storage upload failed: ${uploadError.message}` });
-                    // Clean up pending file state and progress on error too
-                    setPendingFileUploads(prev => { const next = new Map(prev); next.delete(fileInfo.name); return next; });
-                    setUploadProgressMap(prev => { const next = new Map(prev); next.delete(firebasePath || fileInfo.name); return next; });
+            case ServerMessageType.INCOMING_FILE_REQUEST: {
+              const { sender, fileInfo } = message;
+              const tid = generateUniqueId();
+              const req: FileTransferRequest = { id: tid, sender, fileInfo, timestamp: Date.now() };
+              setIncomingFileRequests((p) => new Map(p).set(tid, req));
+              addMessageToHistory(sender, {
+                type: 'file_request',
+                sender,
+                content: `Wants to send you a file:`,
+                fileInfo,
+                transferId: tid,
+              });
+              break;
+            }
+            case ServerMessageType.FILE_ACCEPT_NOTICE: {
+              const { recipient, fileInfo } = message;
+              let tid: string | null = null;
+              sendingFiles.current.forEach((s, id) => {
+                if (
+                  s.recipient === recipient &&
+                  s.fileInfo.name === fileInfo.name &&
+                  s.status === 'pending_accept'
+                )
+                  tid = id;
+              });
+              if (tid && sendingFiles.current.has(tid)) {
+                const ss = sendingFiles.current.get(tid)!;
+                if (ss.encryptedContent) {
+                  ss.status = 'sending';
+                  addMessageToHistory(recipient, {
+                    type: 'file_notice',
+                    content: `User accepted file: ${fileInfo.name}. Sending...`,
+                    transferId: tid,
+                  });
+                  sendChunk(tid, ss);
+                } else {
+                  sendingFiles.current.delete(tid);
+                  addMessageToHistory(recipient, {
+                    type: 'error',
+                    content: `Error starting transfer: Missing content.`,
+                    transferId: tid,
+                  });
                 }
-              } else if (!uploadUrl) {
-                 // Option A: Server handled upload, just notify user
-                 addMessageToHistory(chatKey, {
-                     type: 'file_notice',
-                     content: `${fileInfo.name} was verified and processed by the server.`,
-                     fileInfo: { name: fileInfo.name, firebasePath: firebasePath }
-                 });
-                  // Clean up pending file state even if server uploaded
-                  setPendingFileUploads(prev => { const next = new Map(prev); next.delete(fileInfo.name); return next; });
-              } else if (!originalFile) {
-                  // Error case: Server sent URL but client lost the file object
-                  console.error(`[ERROR] Could not find pending file object for ${fileInfo.name} to upload.`);
-                  addMessageToHistory(chatKey, { type: 'error', content: `Client error: Could not find '${fileInfo.name}' to complete upload.` });
-                   // Clean up progress map if needed
-                  setUploadProgressMap(prev => { const next = new Map(prev); next.delete(firebasePath || fileInfo.name); return next; });
               }
               break;
             }
-            case ServerMessageType.FILE_SCAN_FAILED: {
-              const { fileInfo, reason } = message as FileScanFailedMessage; // Type assertion
-              const chatKey = selectedUser || ALL_CHAT_KEY; // Determine context
-
-              addMessageToHistory(chatKey, {
-                type: 'error',
-                content: `File processing failed for ${fileInfo.name}: ${reason}`,
-                fileInfo: { name: fileInfo.name } // Pass info for potential cleanup
+            case ServerMessageType.FILE_REJECT_NOTICE: {
+              const { recipient, fileInfo } = message;
+              let tid: string | null = null;
+              sendingFiles.current.forEach((s, id) => {
+                if (
+                  s.recipient === recipient &&
+                  s.fileInfo.name === fileInfo.name &&
+                  s.status === 'pending_accept'
+                )
+                  tid = id;
               });
-               // Clean up pending file state on failure
-               setPendingFileUploads(prev => {
-                   const next = new Map(prev);
-                   next.delete(fileInfo.name);
-                   return next;
-               });
-               // Clean up progress map too
-               setUploadProgressMap(prev => {
-                   const next = new Map(prev);
-                   next.delete(fileInfo.name);
-                   return next;
-               });
+              if (tid) {
+                sendingFiles.current.delete(tid);
+                addMessageToHistory(recipient, {
+                  type: 'file_notice',
+                  content: `User rejected file: ${fileInfo.name}`,
+                  transferId: tid,
+                });
+                setTransferProgress((p) => {
+                  const n = { ...p };
+                  delete n[tid!];
+                  return n;
+                });
+              }
+              break;
+            }
+            case ServerMessageType.FILE_CHUNK_RECEIVE: {
+              const { sender, fileInfo, chunkData, chunkIndex, isLastChunk } = message;
+              let tid: string | null = null;
+              receivingFiles.current.forEach((s, id) => {
+                if (
+                  s.sender === sender &&
+                  s.fileInfo.name === fileInfo.name &&
+                  s.status === 'receiving'
+                )
+                  tid = id;
+              });
+              if (!tid || !receivingFiles.current.has(tid)) break;
+              const rs = receivingFiles.current.get(tid)!;
+              if (!rs.aesKey) {
+                receivingFiles.current.delete(tid);
+                addMessageToHistory(sender, {
+                  type: 'error',
+                  content: `Transfer error: Missing key.`,
+                  transferId: tid,
+                });
+                break;
+              }
+              try {
+                const cb = base64ToBuffer(chunkData);
+                rs.chunks.push(cb);
+                rs.receivedBytes += cb.byteLength;
+                const pr = Math.round((rs.receivedBytes / rs.fileInfo.size) * 100);
+                setTransferProgress((p) => ({ ...p, [tid!]: pr }));
+                if (isLastChunk) {
+                  rs.status = 'decrypting';
+                  addMessageToHistory(sender, {
+                    type: 'file_notice',
+                    content: `File received: ${fileInfo.name}. Decrypting...`,
+                    transferId: tid,
+                  });
+                  const teb = new Uint8Array(rs.receivedBytes);
+                  let o = 0;
+                  for (const c of rs.chunks) {
+                    teb.set(new Uint8Array(c), o);
+                    o += c.byteLength;
+                  }
+                  const dfb = await decryptAesGcm(
+                    rs.aesKey,
+                    rs.fileInfo.iv,
+                    bufferToBase64(teb.buffer) // Pass the underlying ArrayBuffer
+                  );
+                  rs.status = 'complete';
+                  const ft = rs.fileInfo.type || 'application/octet-stream';
+                  const blob = new Blob([dfb], { type: ft });
+                  const ou = URL.createObjectURL(blob);
+                  if (ft.startsWith('image/')) {
+                    addMessageToHistory(sender, {
+                      type: 'file_image',
+                      sender,
+                      content: `Received image: ${fileInfo.name}`,
+                      fileInfo: rs.fileInfo,
+                      transferId: tid,
+                      objectUrl: ou,
+                    });
+                  } else {
+                    const a = document.createElement('a');
+                    a.href = ou;
+                    a.download = rs.fileInfo.name;
+                    document.body.appendChild(a);
+                    a.click();
+                    document.body.removeChild(a);
+                    URL.revokeObjectURL(ou);
+                    addMessageToHistory(sender, {
+                      type: 'file_notice',
+                      content: `File downloaded: ${fileInfo.name}`,
+                      transferId: tid,
+                    });
+                  }
+                  receivingFiles.current.delete(tid);
+                  setTransferProgress((p) => {
+                    const n = { ...p };
+                    delete n[tid!];
+                    return n;
+                  });
+                }
+              } catch (e) {
+                receivingFiles.current.delete(tid);
+                addMessageToHistory(sender, {
+                  type: 'error',
+                  content: `Transfer failed: ${e instanceof Error ? e.message : 'Unknown'}`,
+                  transferId: tid,
+                });
+                setTransferProgress((p) => {
+                  const n = { ...p };
+                  delete n[tid!];
+                  return n;
+                });
+              }
               break;
             }
             default:
-              const unknownType = (message as any)?.type;
-              console.warn(`[WS] Unhandled server message type: ${unknownType}`, message);
-              break;
+              console.warn('[WS] Unhandled server message type:', (message as any).type);
           }
         } catch (error) {
           console.error('[WS] Error processing message:', error, 'Raw:', event.data);
           addMessageToHistory(ALL_CHAT_KEY, {
             type: 'error',
-            content: `[Client Error]: Failed processing incoming server message. Check console for details.`,
+            content: `[Client Error]: Failed processing message.`,
           });
         }
-      };
-    };
-
+      }; // End onmessage
+    }; // End connect
     if (connectTimeoutId.current) clearTimeout(connectTimeoutId.current);
     connectTimeoutId.current = setTimeout(() => {
       if (isEffectMounted) connect();
     }, 10);
-
     return () => {
       isEffectMounted = false;
       console.log('[WS] Connection useEffect cleanup.');
+      Object.values(chatHistories)
+        .flat()
+        .forEach((m) => {
+          if (m.objectUrl) URL.revokeObjectURL(m.objectUrl);
+        });
       if (connectTimeoutId.current) clearTimeout(connectTimeoutId.current);
       if (reconnectTimeoutId.current) clearTimeout(reconnectTimeoutId.current);
       const stc = localWsInstance;
@@ -894,13 +908,11 @@ function App(): React.ReactElement {
         if (stc.readyState === WebSocket.OPEN || stc.readyState === WebSocket.CONNECTING) {
           try {
             stc.close(1000, 'Component unmounted');
-          } catch (e) {
-            console.warn('[WS] Error closing WebSocket during cleanup:', e);
-          }
+          } catch (e) {}
         }
       }
     };
-  }, [addMessageToHistory]);
+  }, [addMessageToHistory]); // Keep dependency array minimal
 
   // Effect for Sharing User's Public Key
   useEffect(() => {
@@ -1010,13 +1022,33 @@ function App(): React.ReactElement {
   const handleSendMessage = async (e?: React.FormEvent<HTMLFormElement>) => {
     e?.preventDefault();
     const ti = inputValue.trim();
-    if (ti && !selectedFile) {
-      if (typingTimeoutRef.current) clearTimeout(typingTimeoutRef.current);
-    } else if (selectedFile) {
-      handleSendFile();
-    }
+    if (ti && !selectedFile) await sendTextMessageContent(ti);
+    else if (selectedFile) handleSendFile();
   };
 
+  const validateAndUploadFile = async (file: File) => {
+    const allowedTypes = ['image/png', 'image/jpeg', 'application/pdf'];
+    const maxSize = 5 * 1024 * 1024; // 5MB
+  
+    if (!allowedTypes.includes(file.type)) {
+      alert('❌ File type not allowed.');
+      return;
+    }
+    if (file.size > maxSize) {
+      alert('❌ File too large.');
+      return;
+    }
+  
+    try {
+      const storageRef = ref(storage, `uploads/${file.name}`);
+      await uploadBytes(storageRef, file);
+      alert('✅ Upload successful!');
+    } catch (err) {
+      console.error(err);
+      alert('❌ Upload failed.');
+    }
+  };
+  
   // handleLogout
   const handleLogout = () => {
     if (!isLoggedIn) return;
@@ -1044,9 +1076,20 @@ function App(): React.ReactElement {
     setIsConnected(false);
     setSystemMessage('Logged out.');
     setLoginError('');
-    setPendingFileUploads(new Map());
-    setUploadProgressMap(new Map()); 
-    setSelectedFile(null);
+    setIncomingFileRequests(new Map());
+    sendingFiles.current.clear();
+    receivingFiles.current.clear();
+    setTransferProgress({});
+    setChatHistories({ [ALL_CHAT_KEY]: [] }); // Reset history
+    setTypingUsers({}); // Reset typing indicators
+
+    if (ws.current) {
+      try {
+        if (reconnectTimeoutId.current) clearTimeout(reconnectTimeoutId.current);
+        ws.current.close(1000, 'User logged out');
+        ws.current = null;
+      } catch (e) {}
+    }
   };
 
   const handleUsernameChange = (e: React.ChangeEvent<HTMLInputElement>) => {
@@ -1115,19 +1158,19 @@ function App(): React.ReactElement {
     }
   };
   const handleSelectMainChat = () => setSelectedUser(null);
-  const handleFileChange = async (event: React.ChangeEvent<HTMLInputElement>) => {
+  const handleFileChange = (event: React.ChangeEvent<HTMLInputElement>) => {
     const f = event.target.files?.[0];
     if (f) {
       if (f.size > MAX_FILE_SIZE) {
-        addMessageToHistory(currentChatKey, { type: 'error', content: `File rejected by scan: ${scanResult.message}` });
+        addMessageToHistory(currentChatKey, { type: 'error', content: `File too large.` });
         setSelectedFile(null);
       } else {
-        setSelectedFile(f); 
+        setSelectedFile(f);
       }
       if (fileInputRef.current) fileInputRef.current.value = '';
     } else {
       setSelectedFile(null);
-    } 
+    }
   };
   const handleSendFile = async () => {
     if (!selectedFile || !selectedUser || !isLoggedIn || !isConnected) {
@@ -1147,97 +1190,195 @@ function App(): React.ReactElement {
       sendData({ type: ClientMessageType.REQUEST_PUBLIC_KEY, username: selectedUser });
       return;
     }
-    const file = selectedFile;
-    const recipient = selectedUser;
-    setPendingFileUploads(prev => new Map(prev).set(file.name, file));
+    const f = selectedFile;
+    const tid = generateUniqueId();
     addMessageToHistory(selectedUser, {
       type: 'file_notice',
-      content: `Initiating transfer: ${file.name}`,
-      fileInfo: { name: file.name, size: file.size, type: file.type }
+      content: `Initiating transfer: ${f.name}`,
+      transferId: tid,
     });
     setSelectedFile(null);
     try {
-      // --- 1. Upload to Scanning Service ---
-      const SCANNER_API_UPLOAD_URL = 'YOUR_SCANNER_UPLOAD_ENDPOINT'; // !! REPLACE THIS !!
-      if (SCANNER_API_UPLOAD_URL === 'YOUR_SCANNER_UPLOAD_ENDPOINT') {
-           throw new Error("Scanner API Upload URL is not configured in the client code.");
-      }
-
-      const formData = new FormData();
-      formData.append('file', file); // Common field name, check your API docs
-
-      console.log(`[SCAN] Uploading ${file.name} to ${SCANNER_API_UPLOAD_URL}`);
-      const scanResponse = await fetch(SCANNER_API_UPLOAD_URL, {
-        method: 'POST',
-        body: formData,
-        // Add headers if required by the API (e.g., client-side API key - less secure)
-        // headers: { 'Authorization': 'Bearer YOUR_CLIENT_SIDE_KEY' }
-      });
-
-      if (!scanResponse.ok) {
-        const errorText = await scanResponse.text();
-        throw new Error(`Scanning service upload failed: ${scanResponse.status} ${errorText}`);
-      }
-
-      // IMPORTANT: Adjust parsing based on your API's response structure
-      const scanResult = await scanResponse.json(); // e.g., { scanId: 'xyz123', status: 'clean' or 'infected' or 'pending' }
-      console.log(`[SCAN] Scan service response for ${file.name}:`, scanResult);
-
-      // Handle potentially asynchronous scanning APIs if necessary
-      // if (scanResult.status === 'pending') { /* ... logic to poll or wait ... */ }
-
-      const scanId = scanResult.scanId;
-      // IMPORTANT: Adjust the condition based on your API's success/failure indicators
-      const isPotentiallyHarmful = scanResult.status !== 'clean'; // Example check
-
-      if (!scanId) {
-        throw new Error('Scanning service did not return a scan ID.');
-      }
-      if (isPotentiallyHarmful) {
-           throw new Error(`Scan service reported file as potentially unsafe: Status '${scanResult.status}'`);
-      }
-
-
-      // --- 2. Send Scan Completion to Your Server ---
-      addMessageToHistory(recipient, {
-        type: 'file_notice',
-        content: `Scan complete for ${file.name}. Notifying server for verification...`,
-        fileInfo: { name: file.name }
-      });
-
-      // Prepare basic file info for the server verification step
-      const fileInfoForServer = {
-        name: file.name,
-        size: file.size,
-        type: file.type || 'application/octet-stream',
+      const ak = await generateAesKey();
+      const akr = await exportAesKeyRaw(ak);
+      const ekb64 = await encryptRsaOaep(rpk, base64ToBuffer(akr));
+      const fb = await f.arrayBuffer();
+      const { iv: ivb64, ciphertext: ecb64 } = await encryptAesGcm(ak, fb);
+      const ecb = base64ToBuffer(ecb64);
+      const fi: FileInfo = {
+        name: f.name,
+        size: f.size,
+        type: f.type || 'application/octet-stream',
+        iv: ivb64,
+        encryptedKey: ekb64,
       };
-
+      const tc = Math.ceil(ecb.byteLength / CHUNK_SIZE);
+      const ss: SendingFileState = {
+        file: f,
+        encryptedContent: ecb,
+        recipient: selectedUser,
+        fileInfo: fi,
+        totalChunks: tc,
+        nextChunkIndex: 0,
+        status: 'pending_accept',
+      };
+      sendingFiles.current.set(tid, ss);
+      setTransferProgress((p) => ({ ...p, [tid]: 0 }));
       sendData({
-        type: ClientMessageType.FILE_SCAN_COMPLETE, // Use the new enum value
-        scanId: scanId,
-        fileInfo: fileInfoForServer,
-        recipient: recipient, // Send recipient to server
+        type: ClientMessageType.FILE_TRANSFER_REQUEST,
+        recipient: selectedUser,
+        fileInfo: fi,
       });
-
-    } catch (error: any) {
-      console.error(`[ERROR] Failed file scan initiation for ${file.name}:`, error);
-      addMessageToHistory(recipient, {
+    } catch (e) {
+      console.error(`[ERROR] Failed initiate transfer ${tid}:`, e);
+      addMessageToHistory(selectedUser, {
         type: 'error',
-        content: `Failed to initiate file scan for ${file.name}: ${error.message}`,
+        content: `Failed start transfer: ${e instanceof Error ? e.message : 'Unknown'}`,
+        transferId: tid,
       });
-       setPendingFileUploads(prev => {
-           const next = new Map(prev);
-           next.delete(file.name);
-           return next;
-       });
+      sendingFiles.current.delete(tid);
+      setTransferProgress((p) => {
+        const n = { ...p };
+        delete n[tid];
+        return n;
+      });
     }
   };
-  const handleDownloadFile = (objectUrl: string | undefined, filename: string | undefined) => {
-    if (!objectUrl || !filename) {
-      addMessageToHistory(currentChatKey, {type: 'error', content: 'Download URL or filename missing.'});
+  const sendChunk = (transferId: string, state: SendingFileState) => {
+    if (!state.encryptedContent || state.status !== 'sending') {
+      if (state.status !== 'complete' && state.status !== 'rejected') {
+        sendingFiles.current.delete(transferId);
+        setTransferProgress((p) => {
+          const n = { ...p };
+          delete n[transferId];
+          return n;
+        });
+        addMessageToHistory(state.recipient, {
+          type: 'error',
+          content: `Transfer failed internally.`,
+          transferId,
+        });
+      }
       return;
     }
-    console.log(`Attempting to download ${filename} from ${downloadUrl}`);
+    if (!ws.current || ws.current.readyState !== WebSocket.OPEN) {
+      state.status = 'error';
+      addMessageToHistory(state.recipient, {
+        type: 'error',
+        content: `Transfer failed: Connection lost.`,
+        transferId,
+      });
+      setTransferProgress((p) => ({ ...p, [transferId]: -1 }));
+      return;
+    }
+    const s = state.nextChunkIndex * CHUNK_SIZE;
+    const e = Math.min(s + CHUNK_SIZE, state.encryptedContent.byteLength);
+    const c = state.encryptedContent.slice(s, e);
+    const ilc = e >= state.encryptedContent.byteLength;
+    sendData({
+      type: ClientMessageType.FILE_CHUNK,
+      recipient: state.recipient,
+      fileInfo: { name: state.fileInfo.name },
+      chunkData: bufferToBase64(c),
+      chunkIndex: state.nextChunkIndex,
+      isLastChunk: ilc,
+    });
+    state.nextChunkIndex++;
+    const pr = Math.round((state.nextChunkIndex / state.totalChunks) * 100);
+    setTransferProgress((p) => ({ ...p, [transferId]: pr }));
+    if (ilc) {
+      state.status = 'complete';
+      addMessageToHistory(state.recipient, {
+        type: 'file_notice',
+        content: `File sent: ${state.fileInfo.name}`,
+        transferId,
+      });
+    } else {
+      setTimeout(() => {
+        if (
+          sendingFiles.current.has(transferId) &&
+          sendingFiles.current.get(transferId)?.status === 'sending'
+        )
+          sendChunk(transferId, state);
+      }, 10);
+    }
+  };
+  const handleAcceptFile = async (transferId: string) => {
+    const r = incomingFileRequests.get(transferId);
+    if (!r) return;
+    if (!keyPairRef.current?.privateKey) {
+      addMessageToHistory(r.sender, {
+        type: 'error',
+        content: 'Cannot accept: Keys missing.',
+        transferId,
+      });
+      return;
+    }
+    const { sender, fileInfo } = r;
+    try {
+      const akb = await decryptRsaOaep(keyPairRef.current.privateKey, fileInfo.encryptedKey);
+      const ak = await importAesKeyRaw(bufferToBase64(akb));
+      const rs: ReceivingFileState = {
+        id: transferId,
+        sender,
+        fileInfo,
+        aesKey: ak,
+        chunks: [],
+        receivedBytes: 0,
+        status: 'receiving',
+      };
+      receivingFiles.current.set(transferId, rs);
+      setTransferProgress((p) => ({ ...p, [transferId]: 0 }));
+      setIncomingFileRequests((p) => {
+        const n = new Map(p);
+        n.delete(transferId);
+        return n;
+      });
+      sendData({
+        type: ClientMessageType.FILE_TRANSFER_ACCEPT,
+        sender,
+        fileInfo: { name: fileInfo.name, size: fileInfo.size },
+      });
+      addMessageToHistory(sender, {
+        type: 'file_notice',
+        content: `Accepted file: ${fileInfo.name}. Receiving...`,
+        transferId,
+      });
+    } catch (e) {
+      addMessageToHistory(sender, {
+        type: 'error',
+        content: `Accept failed: ${e instanceof Error ? e.message : 'Error'}`,
+        transferId,
+      });
+      setIncomingFileRequests((p) => {
+        const n = new Map(p);
+        n.delete(transferId);
+        return n;
+      });
+    }
+  };
+  const handleRejectFile = (transferId: string) => {
+    const r = incomingFileRequests.get(transferId);
+    if (!r) return;
+    const { sender, fileInfo } = r;
+    setIncomingFileRequests((p) => {
+      const n = new Map(p);
+      n.delete(transferId);
+      return n;
+    });
+    sendData({
+      type: ClientMessageType.FILE_TRANSFER_REJECT,
+      sender,
+      fileInfo: { name: fileInfo.name },
+    });
+    addMessageToHistory(sender, {
+      type: 'file_notice',
+      content: `Rejected file: ${fileInfo.name}`,
+      transferId,
+    });
+  };
+  const handleDownloadFile = (objectUrl: string | undefined, filename: string | undefined) => {
+    if (!objectUrl || !filename) return;
     const a = document.createElement('a');
     a.href = objectUrl;
     a.download = filename;
@@ -1274,18 +1415,19 @@ function App(): React.ReactElement {
       ), // Add users from history (excluding self and All Chat)
     ])
   );
-  const fileTransferReady = !!selectedUser;
+  const fileTransferReady = selectedUser ? peerPublicKeys.has(selectedUser) : false;
   // Get users currently typing in the active chat context
   const usersTypingInCurrentChat = Array.from(typingUsers[currentChatKey] || []);
 
   // Render UI
   return (
     <div className="flex flex-col h-screen bg-gradient-to-br from-blue-100 via-purple-100 to-pink-100 p-4 gap-4 font-sans">
-      {/* Header */}
+      {/* Header (Unchanged) */}
       <header className="text-center py-2">
         <h1 className="text-2xl font-bold text-gray-800">Secure Chat</h1>
         <div className="text-sm text-gray-600 mt-1 flex items-center justify-center gap-x-2 flex-wrap">
           <span>
+            {' '}
             Status:{' '}
             {isConnected ? (
               <span className="text-green-600 font-semibold">Connected</span>
@@ -1312,7 +1454,7 @@ function App(): React.ReactElement {
 
       {/* Main Layout */}
       <div className="flex flex-1 gap-4 overflow-hidden">
-        {/* Sidebar */}
+        {/* Sidebar (MODIFIED - Iterates over displayablePeers) */}
         <Card className="w-60 flex flex-col bg-white/80 backdrop-blur-sm border-gray-200 shadow-md rounded-lg">
           <CardHeader className="p-3 border-b bg-gray-50/80 rounded-t-lg">
             <CardTitle className="text-lg text-gray-700">Conversations</CardTitle>
@@ -1327,8 +1469,9 @@ function App(): React.ReactElement {
                 disabled={!isLoggedIn}
                 title="Switch to All Chat (Broadcast)"
               >
-                <Users className="h-5 w-5 text-gray-600" />
-                <span className="font-medium">All Chat</span>
+                {' '}
+                <Users className="h-5 w-5 text-gray-600" />{' '}
+                <span className="font-medium">All Chat</span>{' '}
               </Button>
               <hr className="my-2 border-gray-200" />
               {/* Conversation List */}
@@ -1402,13 +1545,15 @@ function App(): React.ReactElement {
 
         {/* Chat Area */}
         <Card className="flex-1 flex flex-col bg-white/80 backdrop-blur-sm border-gray-200 shadow-md rounded-lg overflow-hidden">
-          {/* Chat Header */}
+          {/* Chat Header (Unchanged) */}
           <CardHeader className="p-3 border-b bg-gray-50/80 rounded-t-lg">
             <div className="flex justify-between items-center">
               <div className="flex items-center gap-2">
+                {' '}
                 <CardTitle className="text-lg text-gray-700">
-                  {selectedUser ? `Chat with ${selectedUser}` : 'All Chat'}
-                </CardTitle>
+                  {' '}
+                  {selectedUser ? `Chat with ${selectedUser}` : 'All Chat'}{' '}
+                </CardTitle>{' '}
               </div>
               {selectedUser && (
                 <Button
@@ -1418,7 +1563,8 @@ function App(): React.ReactElement {
                   className="text-xs text-blue-600 hover:text-blue-800"
                   title="Back to All Chat"
                 >
-                  <X className="h-4 w-4 mr-1" /> Back to All
+                  {' '}
+                  <X className="h-4 w-4 mr-1" /> Back to All{' '}
                 </Button>
               )}
             </div>
@@ -1436,33 +1582,77 @@ function App(): React.ReactElement {
                   const messageKey = msg.transferId
                     ? `${msg.transferId}-${msg.type}-${index}`
                     : msg.timestamp
-                      ? `${msg.timestamp}-${index}`
-                      : `msg-${index}`;
+                    ? `${msg.timestamp}-${index}`
+                    : `msg-${index}`;
                   // File Transfer Messages (Non-persisted)
-                  if (msg.type === 'file_notice' && msg.fileInfo) {
-                    const progressKey = msg.fileInfo.firebasePath || msg.fileInfo.name;
-                    const progress = uploadProgressMap.get(progressKey);
-                    const isUploading = progress !== undefined && progress >= 0 && progress < 100;
-                    const noticeText = typeof msg.content === 'string' ? msg.content : 'File Notice';
-
+                  if (msg.type === 'file_request' && msg.transferId && msg.fileInfo) {
+                    const r = incomingFileRequests.get(msg.transferId);
+                    if (!r) return null;
                     return (
                       <Alert
-                      key={messageKey}
-                      variant="default"
-                      className="bg-gray-50 border-gray-200 text-xs"
-                    >
-                      <FileIcon className="h-4 w-4" />
-                      <AlertDescription>
-                        {noticeText}
-                        {isUploading && (
-                          <Progress value={progress} className="w-full h-1.5 mt-1" />
-                        )}
-                        {/* Maybe add download link here if fileInfo.firebasePath exists and upload is complete? */}
-                      </AlertDescription>
-                    </Alert>
+                        key={messageKey}
+                        variant="default"
+                        className="bg-blue-50 border-blue-200"
+                      >
+                        {' '}
+                        <FileIcon className="h-4 w-4" />{' '}
+                        <AlertTitle className="font-semibold">
+                          Incoming File from {msg.sender}
+                        </AlertTitle>{' '}
+                        <AlertDescription className="text-sm">
+                          {' '}
+                          <p className="mb-2">
+                            {' '}
+                            User <span className="font-medium">{msg.sender}</span> wants to send you{' '}
+                            <span className="font-medium">{msg.fileInfo.name}</span> ({' '}
+                            {(msg.fileInfo.size / 1024 / 1024).toFixed(2)} MB).{' '}
+                          </p>{' '}
+                          <div className="flex gap-2 mt-2">
+                            {' '}
+                            <Button
+                              size="sm"
+                              variant="default"
+                              onClick={() => handleAcceptFile(msg.transferId!)}
+                            >
+                              {' '}
+                              <Check className="h-4 w-4 mr-1" /> Accept{' '}
+                            </Button>{' '}
+                            <Button
+                              size="sm"
+                              variant="destructive"
+                              onClick={() => handleRejectFile(msg.transferId!)}
+                            >
+                              {' '}
+                              <X className="h-4 w-4 mr-1" /> Reject{' '}
+                            </Button>{' '}
+                          </div>{' '}
+                        </AlertDescription>{' '}
+                      </Alert>
                     );
                   }
-                  
+                  if (msg.type === 'file_notice') {
+                    const p = transferProgress[msg.transferId!] ?? null;
+                    const iS = sendingFiles.current.has(msg.transferId!);
+                    const iR = receivingFiles.current.has(msg.transferId!);
+                    const st = typeof msg.content === 'string' ? msg.content : 'File Notice';
+                    return (
+                      <Alert
+                        key={messageKey}
+                        variant="default"
+                        className="bg-gray-50 border-gray-200 text-xs"
+                      >
+                        {' '}
+                        <FileIcon className="h-4 w-4" />{' '}
+                        <AlertDescription>
+                          {' '}
+                          {st}{' '}
+                          {(iS || iR) && p !== null && p >= 0 && p <= 100 && (
+                            <Progress value={p} className="w-full h-2 mt-1" />
+                          )}{' '}
+                        </AlertDescription>{' '}
+                      </Alert>
+                    );
+                  }
                   if (msg.type === 'file_image' && msg.objectUrl && msg.fileInfo) {
                     return (
                       <div
@@ -1471,32 +1661,37 @@ function App(): React.ReactElement {
                           msg.sender === currentUsername ? 'items-end' : 'items-start'
                         }`}
                       >
+                        {' '}
                         <div className="p-2 border rounded-lg bg-gray-100 max-w-xs md:max-w-sm">
+                          {' '}
                           <p className="text-xs font-semibold mb-1 text-gray-700">
                             {msg.sender}
-                          </p>
+                          </p>{' '}
                           <img
                             src={msg.objectUrl}
                             alt={`Image from ${msg.sender}: ${msg.fileInfo.name}`}
                             className="max-w-full h-auto rounded block object-contain bg-white"
-                          />
+                          />{' '}
                           <div className="flex justify-between items-center mt-2">
+                            {' '}
                             <span
                               className="text-xs text-gray-600 truncate"
                               title={msg.fileInfo.name}
                             >
-                              {msg.fileInfo.name}
-                            </span>
+                              {' '}
+                              {msg.fileInfo.name}{' '}
+                            </span>{' '}
                             <Button
                               size="sm"
                               variant="outline"
                               className="h-7 px-2 text-xs"
                               onClick={() => handleDownloadFile(msg.objectUrl, msg.fileInfo?.name)}
                             >
-                              <Download className="h-3 w-3 mr-1" /> Download
-                            </Button>
-                          </div>
-                        </div>
+                              {' '}
+                              <Download className="h-3 w-3 mr-1" /> Download{' '}
+                            </Button>{' '}
+                          </div>{' '}
+                        </div>{' '}
                       </div>
                     );
                   }
@@ -1533,6 +1728,7 @@ function App(): React.ReactElement {
                             msg.type === 'my_chat' ? 'items-end' : 'items-start'
                           }`}
                         >
+                          {' '}
                           <div
                             className={`max-w-xs md:max-w-md lg:max-w-lg rounded-lg px-3 py-2 shadow-sm text-sm ${
                               msg.type === 'my_chat'
@@ -1540,18 +1736,20 @@ function App(): React.ReactElement {
                                 : 'bg-gray-100 text-gray-900'
                             }`}
                           >
+                            {' '}
                             {msg.sender && msg.type !== 'my_chat' && (
                               <p className="text-xs font-semibold mb-0.5 text-gray-700">
                                 {msg.sender}
                               </p>
-                            )}
-                            {rc}
-                          </div>
+                            )}{' '}
+                            {rc}{' '}
+                          </div>{' '}
                         </div>
                       );
                     } else {
                       return (
                         <div key={messageKey} className={`flex flex-col items-center w-full`}>
+                          {' '}
                           <div
                             className={`max-w-full rounded-lg px-3 py-1 break-words shadow-none text-xs text-center ${
                               msg.type === 'error'
@@ -1559,35 +1757,13 @@ function App(): React.ReactElement {
                                 : 'text-gray-500 italic bg-transparent'
                             }`}
                           >
-                            {rc}
-                          </div>
+                            {' '}
+                            {rc}{' '}
+                          </div>{' '}
                         </div>
                       );
                     }
                   }
-                  if (msg.type === 'file_download_link' && msg.fileInfo?.firebasePath) {
-                    // TODO: Implement requesting a signed download URL from server
-                    const handleRequestDownload = async (path: string, name: string) => {
-                        console.log("Requesting download URL for:", path);
-                         // Send message to server: { type: 'request_download_url', firebasePath: path }
-                         // Server responds with: { type: 'download_url_response', downloadUrl: '...', fileName: name }
-                         // Then trigger download: window.open(downloadUrl, '_blank'); or use fetch+blob
-                         addMessageToHistory(currentChatKey, {type: 'system', content: `Download for ${name} not implemented yet.`});
-                    };
-                    return (
-                         <Alert key={messageKey} variant="default" className="bg-green-50 border-green-200">
-                             <FileIcon className="h-4 w-4 text-green-700"/>
-                             <AlertTitle className="font-semibold">File Ready: {msg.fileInfo.name}</AlertTitle>
-                             <AlertDescription>
-                                 Sent by {msg.sender || 'Unknown'}.
-                                 <Button size="sm" variant="link" className="p-0 h-auto ml-2 text-green-700"
-                                     onClick={() => handleRequestDownload(msg.fileInfo!.firebasePath!, msg.fileInfo!.name!)}>
-                                     Download
-                                 </Button>
-                             </AlertDescription>
-                         </Alert>
-                    );
-                }
                   return null;
                 })}
                 <div ref={messagesEndRef} />
@@ -1599,12 +1775,14 @@ function App(): React.ReactElement {
           <CardFooter className="p-4 border-t bg-gray-50/80">
             {!isLoggedIn ? (
               /* Login Form */ <form onSubmit={handleLogin} className="w-full space-y-3">
-                <h3 className="text-center font-medium text-gray-700">Please Log In</h3>
-                {loginError && <p className="text-red-500 text-sm text-center">{loginError}</p>}
+                {' '}
+                <h3 className="text-center font-medium text-gray-700">Please Log In</h3>{' '}
+                {loginError && <p className="text-red-500 text-sm text-center">{loginError}</p>}{' '}
                 {systemMessage && !loginError && (
                   <p className="text-yellow-600 text-sm text-center">{systemMessage}</p>
-                )}
+                )}{' '}
                 <div className="flex flex-col sm:flex-row gap-2">
+                  {' '}
                   <Input
                     type="text"
                     placeholder="Username"
@@ -1615,7 +1793,7 @@ function App(): React.ReactElement {
                     className="flex-1"
                     autoComplete="username"
                     required
-                  />
+                  />{' '}
                   <Input
                     type="password"
                     placeholder="Password"
@@ -1626,8 +1804,8 @@ function App(): React.ReactElement {
                     className="flex-1"
                     autoComplete="current-password"
                     required
-                  />
-                </div>
+                  />{' '}
+                </div>{' '}
                 <Button
                   type="submit"
                   disabled={
@@ -1637,12 +1815,13 @@ function App(): React.ReactElement {
                   }
                   className="w-full"
                 >
+                  {' '}
                   {!keyPairRef.current
                     ? 'Generating Keys...'
                     : !isConnected
-                      ? 'Connecting...'
-                      : 'Login / Register'}
-                </Button>
+                    ? 'Connecting...'
+                    : 'Login / Register'}{' '}
+                </Button>{' '}
               </form>
             ) : (
               /* Message Input Form Area */
@@ -1670,7 +1849,8 @@ function App(): React.ReactElement {
                       !selectedUser || !fileTransferReady ? 'text-gray-400 cursor-not-allowed' : ''
                     }`}
                   >
-                    <Paperclip className="h-5 w-5" />
+                    {' '}
+                    <Paperclip className="h-5 w-5" />{' '}
                   </Button>
                   <input
                     type="file"
@@ -1681,13 +1861,15 @@ function App(): React.ReactElement {
                   />
                   {selectedFile && selectedUser ? (
                     <div className="flex items-center gap-2 flex-1 bg-gray-100 p-1 rounded-md border h-10">
-                      <FileIcon className="h-4 w-4 text-gray-600 shrink-0 ml-1" />
+                      {' '}
+                      <FileIcon className="h-4 w-4 text-gray-600 shrink-0 ml-1" />{' '}
                       <span
                         className="text-sm text-gray-700 truncate flex-1"
                         title={selectedFile.name}
                       >
-                        {selectedFile.name} ({(selectedFile.size / 1024).toFixed(1)} KB)
-                      </span>
+                        {' '}
+                        {selectedFile.name} ({(selectedFile.size / 1024).toFixed(1)} KB){' '}
+                      </span>{' '}
                       <Button
                         type="button"
                         size="icon"
@@ -1696,8 +1878,9 @@ function App(): React.ReactElement {
                         onClick={() => setSelectedFile(null)}
                         title="Cancel file selection"
                       >
-                        <Trash2 className="h-4 w-4 text-red-500" />
-                      </Button>
+                        {' '}
+                        <Trash2 className="h-4 w-4 text-red-500" />{' '}
+                      </Button>{' '}
                       <Button
                         type="button"
                         size="sm"
@@ -1706,8 +1889,9 @@ function App(): React.ReactElement {
                         title={`Send file to ${selectedUser}`}
                         disabled={!fileTransferReady}
                       >
-                        <Upload className="h-4 w-4 mr-1" /> Send
-                      </Button>
+                        {' '}
+                        <Upload className="h-4 w-4 mr-1" /> Send{' '}
+                      </Button>{' '}
                     </div>
                   ) : (
                     <div className="flex-1 relative flex items-center">
@@ -1732,9 +1916,10 @@ function App(): React.ReactElement {
                       {/* Emoji Picker */}
                       <Popover open={showEmojiPicker} onOpenChange={setShowEmojiPicker}>
                         <PopoverTrigger
-                          className="absolute right-1 top-1/2 -translate-y-1/2 h-7 w-7 p-0 inline-flex items-center justify-center rounded-md text-sm font-medium transition-colors focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-ring disabled:pointer-events-none disabled:opacity-50 text-gray-500 hover:bg-accent hover:text-accent-foreground"
+                          className="absolute right-1 top-1/2 -translate-y-1/2 h-7 w-7 p-0 inline-flex items-center justify-center rounded-md text-sm font-medium transition-colors focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-ring disabled:pointer-events-none disabled:opacity-50 text-gray-500 hover:bg-accent hover:text-accent-foreground" // Styles copied from Button variant=ghost, size=icon
                           title="Select emoji"
                         >
+                          {/* Icon is now the direct child */}
                           <Smile className="h-5 w-5" />
                         </PopoverTrigger>
                         <PopoverContent className="w-auto p-0 mb-1" side="top" align="end">
@@ -1759,7 +1944,8 @@ function App(): React.ReactElement {
                       disabled={!inputValue.trim() || !isConnected || !serverPublicKey}
                       className="shrink-0"
                     >
-                      <SendHorizonal className="h-4 w-4" />
+                      {' '}
+                      <SendHorizonal className="h-4 w-4" />{' '}
                     </Button>
                   )}
                   <Button
@@ -1772,7 +1958,8 @@ function App(): React.ReactElement {
                     disabled={!isLoggedIn}
                     className="shrink-0"
                   >
-                    <LogOut className="h-4 w-4" />
+                    {' '}
+                    <LogOut className="h-4 w-4" />{' '}
                   </Button>
                 </div>
               </div>
