@@ -1,6 +1,11 @@
 import HtmlWebpackPlugin from 'html-webpack-plugin'; // Use import
 import path from 'path';
 import { fileURLToPath } from 'url'; // Needed for __dirname in ESM
+import dotenv from 'dotenv';
+import webpack from 'webpack';
+
+// Load environment variables from .env file
+dotenv.config();
 
 // Recreate __dirname for ES Modules
 const __filename = fileURLToPath(import.meta.url);
@@ -97,6 +102,14 @@ export default (env, argv) => {
       new HtmlWebpackPlugin({
         template: './index.html', // Path to your source HTML file
         filename: 'index.html', // Name of the generated HTML file in the output directory
+      }),
+      new webpack.DefinePlugin({
+        'process.env.VITE_FIREBASE_API_KEY': JSON.stringify(process.env.VITE_FIREBASE_API_KEY),
+        'process.env.VITE_FIREBASE_AUTH_DOMAIN': JSON.stringify(process.env.VITE_FIREBASE_AUTH_DOMAIN),
+        'process.env.VITE_FIREBASE_PROJECT_ID': JSON.stringify(process.env.VITE_FIREBASE_PROJECT_ID),
+        'process.env.VITE_FIREBASE_STORAGE_BUCKET': JSON.stringify(process.env.VITE_FIREBASE_STORAGE_BUCKET),
+        'process.env.VITE_FIREBASE_MESSAGING_SENDER_ID': JSON.stringify(process.env.VITE_FIREBASE_MESSAGING_SENDER_ID),
+        'process.env.VITE_FIREBASE_APP_ID': JSON.stringify(process.env.VITE_FIREBASE_APP_ID),
       }),
     ],
 

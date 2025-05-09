@@ -4,3 +4,4 @@ certs/*
 dist
 serviceAccountKey.json
 .env
+firebase.ts

@@ -4,7 +4,8 @@ import DOMPurify from 'dompurify';
 import EmojiPicker, { EmojiClickData, Theme as EmojiTheme } from 'emoji-picker-react';
 import { marked } from 'marked';
 import TextareaAutosize from 'react-textarea-autosize';
-
+import { storage } from './firebase'; // adjust path as needed
+import { ref, uploadBytes } from 'firebase/storage';
 // Shadcn UI Component Imports
 import { Alert, AlertDescription, AlertTitle } from '@/components/ui/alert';
 import { Button } from '@/components/ui/button';
@@ -1025,6 +1026,10 @@ function App(): React.ReactElement {
     else if (selectedFile) handleSendFile();
   };
 
+  
+  if (selectedFile) {
+    console.log('[DEBUG] Uploading file:', selectedFile.name);
+  }
   // handleLogout
   const handleLogout = () => {
     if (!isLoggedIn) return;
@@ -1136,17 +1141,52 @@ function App(): React.ReactElement {
   const handleSelectMainChat = () => setSelectedUser(null);
   const handleFileChange = (event: React.ChangeEvent<HTMLInputElement>) => {
     const f = event.target.files?.[0];
-    if (f) {
-      if (f.size > MAX_FILE_SIZE) {
-        addMessageToHistory(currentChatKey, { type: 'error', content: `File too large.` });
-        setSelectedFile(null);
-      } else {
-        setSelectedFile(f);
-      }
-      if (fileInputRef.current) fileInputRef.current.value = '';
-    } else {
+    if (!f) {
       setSelectedFile(null);
+      return;
     }
+  
+    // Basic validation
+    const allowedTypes = ['image/png', 'image/jpeg', 'application/pdf'];
+    const maxSize = 5 * 1024 * 1024; // 5MB
+  
+    if (!allowedTypes.includes(f.type)) {
+      addMessageToHistory(currentChatKey, {
+        type: 'error',
+        content: '❌ Invalid file type.',
+      });
+      return;
+    }
+  
+    if (f.size > maxSize) {
+      addMessageToHistory(currentChatKey, {
+        type: 'error',
+        content: '❌ File too large (max 5MB).',
+      });
+      return;
+    }
+  
+    setSelectedFile(f);
+  
+    // Upload to Firebase
+    const storageRef = ref(storage, `uploads/${f.name}`);
+    uploadBytes(storageRef, f)
+      .then((snapshot) => {
+        console.log('[DEBUG] File upload succeeded:', snapshot);
+        addMessageToHistory(currentChatKey, {
+          type: 'system',
+          content: ` File "${f.name}" uploaded successfully.`,
+        });
+      })
+      .catch((error) => {
+        console.error('[DEBUG] Upload failed:', error);
+        addMessageToHistory(currentChatKey, {
+          type: 'error',
+          content: ` Upload failed.`,
+        });
+      });
+  
+    if (fileInputRef.current) fileInputRef.current.value = '';
   };
   const handleSendFile = async () => {
     if (!selectedFile || !selectedUser || !isLoggedIn || !isConnected) {
