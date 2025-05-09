@@ -34,69 +34,16 @@ Before running the project, ensure you have the following installed:
 - WebSocket package (`npm install ws`)  
 - HTTPS support (`npm install https`)
 
-## Setup Instructions
+## Setup and Guide Instructions
 
-### 1. Install Dependencies
-
-Navigate to the project directory and install the required Node modules:
-
-```bash
-npm install
-```
-
-### 2. Generate SSL Certificates
-```bash
-mkdir certs
-openssl req -x509 -newkey rsa:2048 -keyout certs/private.pem -out certs/public.pem -days 365 -nodes
-```
-
-### 3. Start the WebSocket Server
-Run the following command to start the server:
-```bash
-cd src
-node server.ts
-```
-#### Expected output:
-Expected output:
-```
-[SERVER] Listening on wss://0.0.0.0:8080
-```
-### 4. Connect a Client
-Open a new terminal and start the client:
-```BASH
-node client.ts
-```
-#### Expected output:
-```
-Connecting to server...
-[CONNECTED] Successfully connected to the server.
-[SERVER]: Welcome to the WebSocket server!
-[CONNECTED] Please enter your credentials:
-Username:
-```
-Enter your username and password when prompted.
-
-### 5. Send Messages
-Once logged in, type a message and press Enter to send it.
-To log out, type:
-```
-/logout
-```
-
-## Troubleshooting
-### 1. Connection Refused (ECONNREFUSED)
- - Ensure the server is running (node src/server.ts).
- - Verify that port 8080 is open (netstat -an | find "8080").
- - If running on Windows, allow port 8080 through the firewall:
- - Open Windows Defender Firewall.
- - Go to Advanced settings > Inbound Rules > New Rule.
- - Select Port, choose TCP, and enter 8080.
- - Allow the connection and name the rule.
-
-### 2. WebSocket SSL Issues (self-signed certificate error)
-If the client fails due to a self-signed certificate, use the --no-check option with wscat:
-```bash
-wscat --no-check -c wss://127.0.0.1:8080
-```
-
-## Note: AI was used to help format this readme file
+1. User can enter the website link:
+    https://securechat.ct.ws/
+2. User can login or sign up their Id and password
+3.  In the chat room, all user can communication to everybody in the room, or they can click on username who they want to chat in private.
+4. In the private chat room, User can send file to each other which is under <5MB> and in the format 'image/png', 'image/jpeg', 'application/pdf'.
+- Sender will know when the Receiver accept and download the file by the loading line moving.
+- The file will be stored on uploads/ folder in the Firebase Storage.
+- Their chat log will be hash and stored on chatlogs/ folder of Firebase Database.
+- Their credentials will be stored on users/ folder in the Firebase Database. 
+5. If the user is not activing in 5 minutes, they will be disconnected and must be re-log in to continue.
+6. User must wait awhile for typed wrong password many times.
