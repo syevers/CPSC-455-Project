@@ -1153,7 +1153,7 @@ function App(): React.ReactElement {
     if (!allowedTypes.includes(f.type)) {
       addMessageToHistory(currentChatKey, {
         type: 'error',
-        content: '❌ Invalid file type.',
+        content: 'Invalid file type.',
       });
       return;
     }
@@ -1161,7 +1161,7 @@ function App(): React.ReactElement {
     if (f.size > maxSize) {
       addMessageToHistory(currentChatKey, {
         type: 'error',
-        content: '❌ File too large (max 5MB).',
+        content: 'File too large (max 5MB).',
       });
       return;
     }
